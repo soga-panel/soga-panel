@@ -2,6 +2,10 @@ import { Router, type Request, type Response } from "express";
 import type { AppContext } from "../../types";
 import { createAuthMiddleware } from "../../middleware/auth";
 import { errorResponse, successResponse } from "../../utils/response";
+import {
+  formatRemoteAccountIdForResponse,
+  serializeRemoteAccountIdForDb,
+} from "../../utils/sharedIds";
 
 export function createAdminSharedIdRouter(ctx: AppContext) {
   const router = Router();
@@ -60,7 +64,12 @@ export function createAdminSharedIdRouter(ctx: AppContext) {
       .bind(...params, limit, offset)
       .all<Record<string, unknown>>();
 
-    const records = listResult.results ?? [];
+    const records = (listResult.results ?? []).map((row) => ({
+      ...row,
+      remote_account_id: formatRemoteAccountIdForResponse(
+        (row as Record<string, unknown>).remote_account_id
+      ),
+    }));
 
     return successResponse(res, {
       records,
@@ -76,11 +85,22 @@ export function createAdminSharedIdRouter(ctx: AppContext) {
   router.post("/", async (req: Request, res: Response) => {
     if (!ensureAdmin(req, res)) return;
     const { name, fetch_url, remote_account_id, status } = req.body || {};
-    if (!name || !fetch_url || !remote_account_id) return errorResponse(res, "参数缺失", 400);
+    const trimmedName = typeof name === "string" ? name.trim() : "";
+    const trimmedUrl = typeof fetch_url === "string" ? fetch_url.trim() : "";
+    if (!trimmedName || !trimmedUrl) return errorResponse(res, "参数缺失", 400);
+
+    let remoteAccountIdValue = "";
+    try {
+      remoteAccountIdValue = serializeRemoteAccountIdForDb(remote_account_id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "远程账号 ID 格式不正确";
+      return errorResponse(res, message, 400);
+    }
+
     await ctx.dbService.createSharedId({
-      name,
-      fetchUrl: fetch_url,
-      remoteAccountId: Number(remote_account_id),
+      name: trimmedName,
+      fetchUrl: trimmedUrl,
+      remoteAccountId: remoteAccountIdValue,
       status: status ?? 1
     });
     return successResponse(res, null, "已创建");
@@ -89,10 +109,19 @@ export function createAdminSharedIdRouter(ctx: AppContext) {
   router.put("/:id", async (req: Request, res: Response) => {
     if (!ensureAdmin(req, res)) return;
     const id = Number(req.params.id);
+    let remoteAccountIdValue: string | undefined;
+    if (req.body?.remote_account_id !== undefined) {
+      try {
+        remoteAccountIdValue = serializeRemoteAccountIdForDb(req.body.remote_account_id);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "远程账号 ID 格式不正确";
+        return errorResponse(res, message, 400);
+      }
+    }
     await ctx.dbService.updateSharedId(id, {
       name: req.body?.name,
       fetchUrl: req.body?.fetch_url,
-      remoteAccountId: req.body?.remote_account_id ? Number(req.body.remote_account_id) : undefined,
+      remoteAccountId: remoteAccountIdValue,
       status: req.body?.status
     });
     return successResponse(res, null, "已更新");

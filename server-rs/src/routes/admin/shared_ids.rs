@@ -8,6 +8,10 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::response::{error, success};
+use crate::shared_ids::{
+  format_remote_account_id_for_response_text,
+  serialize_remote_account_id_for_db
+};
 use crate::state::AppState;
 
 use super::super::auth::require_admin_user_id;
@@ -26,7 +30,7 @@ struct SharedIdQuery {
 struct SharedIdPayload {
   name: Option<String>,
   fetch_url: Option<String>,
-  remote_account_id: Option<i64>,
+  remote_account_id: Option<Value>,
   status: Option<i64>
 }
 
@@ -109,11 +113,23 @@ async fn get_shared_ids(
   let records = rows
     .into_iter()
     .map(|row| {
+      let remote_text = row
+        .try_get::<Option<String>, _>("remote_account_id")
+        .ok()
+        .flatten()
+        .or_else(|| {
+          row
+            .try_get::<Option<i64>, _>("remote_account_id")
+            .ok()
+            .flatten()
+            .map(|value| value.to_string())
+        })
+        .unwrap_or_default();
       json!({
         "id": row.try_get::<i64, _>("id").unwrap_or(0),
         "name": row.try_get::<Option<String>, _>("name").ok().flatten().unwrap_or_default(),
         "fetch_url": row.try_get::<Option<String>, _>("fetch_url").ok().flatten().unwrap_or_default(),
-        "remote_account_id": row.try_get::<Option<i64>, _>("remote_account_id").unwrap_or(Some(0)).unwrap_or(0),
+        "remote_account_id": format_remote_account_id_for_response_text(&remote_text),
         "status": row.try_get::<Option<i64>, _>("status").unwrap_or(Some(0)).unwrap_or(0),
         "created_at": row.try_get::<Option<chrono::NaiveDateTime>, _>("created_at").ok().flatten().map(format_datetime),
         "updated_at": row.try_get::<Option<chrono::NaiveDateTime>, _>("updated_at").ok().flatten().map(format_datetime)
@@ -146,8 +162,12 @@ async fn post_shared_id(
   }
   let name = body.name.unwrap_or_default().trim().to_string();
   let fetch_url = body.fetch_url.unwrap_or_default().trim().to_string();
-  let remote_account_id = body.remote_account_id.unwrap_or(0);
-  if name.is_empty() || fetch_url.is_empty() || remote_account_id <= 0 {
+  let remote_account_value = body.remote_account_id.unwrap_or(Value::Null);
+  let remote_account_text = match serialize_remote_account_id_for_db(&remote_account_value) {
+    Ok(value) => value,
+    Err(message) => return error(StatusCode::BAD_REQUEST, &message, None)
+  };
+  if name.is_empty() || fetch_url.is_empty() {
     return error(StatusCode::BAD_REQUEST, "参数缺失", None);
   }
   let status = body.status.unwrap_or(1);
@@ -160,7 +180,7 @@ async fn post_shared_id(
   )
   .bind(&name)
   .bind(&fetch_url)
-  .bind(remote_account_id)
+  .bind(remote_account_text)
   .bind(status)
   .execute(&state.db)
   .await
@@ -202,8 +222,12 @@ async fn put_shared_id(
     }
   }
   if let Some(value) = body.remote_account_id {
+    let remote_account_text = match serialize_remote_account_id_for_db(&value) {
+      Ok(value) => value,
+      Err(message) => return error(StatusCode::BAD_REQUEST, &message, None)
+    };
     updates.push("remote_account_id = ?".to_string());
-    params.push(SqlParam::I64(value));
+    params.push(SqlParam::String(remote_account_text));
   }
   if let Some(value) = body.status {
     updates.push("status = ?".to_string());

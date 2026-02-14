@@ -393,11 +393,11 @@
   - query: `{ page?: number; limit?: number; keyword?: string; status?: string | number }`
   - 返回: `ApiResponse<{ records: SharedIdConfig[]; pagination: { total: number; page: number; limit: number; totalPages: number } }>`
 - `POST /admin/shared-ids`
-  - body: `{ name: string; fetch_url: string; remote_account_id: number; status?: number }`
+  - body: `{ name: string; fetch_url: string; remote_account_id: number | number[]; status?: number }`
   - 返回: `ApiResponse<{ record: SharedIdConfig }>`
 - `PUT /admin/shared-ids/{id}`
   - path: `{ id: number }`
-  - body: `{ name?: string; fetch_url?: string; remote_account_id?: number; status?: number }`
+  - body: `{ name?: string; fetch_url?: string; remote_account_id?: number | number[]; status?: number }`
   - 返回: `ApiResponse<{ record: SharedIdConfig }>`
 - `DELETE /admin/shared-ids/{id}`
   - path: `{ id: number }`
@@ -616,7 +616,7 @@
 - `NodeStatusStatistics`: `{ total: number; online: number; offline: number; enabled?: number; disabled?: number }`
 - `NodeStatusResponse`: `{ nodes: NodeStatus[]; statistics: NodeStatusStatistics; pagination?: { total: number; page: number; limit: number } }`
 - `CreateNodeRequest`: `{ name: string; type: string; server: string; server_port: number; tls_host?: string; node_class: number; node_bandwidth_limit?: number; traffic_multiplier?: number; node_config?: string; bandwidthlimit_resetday?: number }`
-- `SharedIdConfig`: `{ id: number; name: string; fetch_url: string; remote_account_id: number; status: number; created_at?: string; updated_at?: string }`
+- `SharedIdConfig`: `{ id: number; name: string; fetch_url: string; remote_account_id: number | number[]; status: number; created_at?: string; updated_at?: string }`
 - `SystemStats`: `{ users: { total: number; active: number; disabled: number; admins: number }; nodes: { total: number; active: number; online: number; offline: number }; traffic: { total: number; today: number; average_quota: number } }`
 - `LoginLog`: `{ id: number; user_id: number; user_email?: string; login_ip: string; login_time: string; user_agent?: string; login_status: number; failure_reason?: string; login_method?: string; created_at: string }`
 - `SubscriptionLog`: `{ id: number; user_id: number; user_email: string; type: string; request_ip: string; request_time: string; request_user_agent: string }`
@@ -631,6 +631,6 @@
 - `SystemConfig`: `{ id: number; key: string; value: string; description: string }`
 - `SystemConfigUpdate`: `{ key: string; value: string }`
 - `SystemConfigBatchUpdate`: `{ configs: SystemConfigUpdate[] }`
-- `SharedIdItem`: `{ id: number; name: string; remote_account_id: number; status: 'ok' | 'missing' | 'error'; account: Record<string, unknown> | null; fetched_at?: string; message?: string | null; error?: string }`
+- `SharedIdItem`: `{ id: number; name: string; remote_account_id: number | number[]; status: 'ok' | 'missing' | 'error'; account: Record<string, unknown> | null; accounts?: Record<string, unknown>[]; missing_ids?: number[]; fetched_at?: string; message?: string | null; error?: string }`
 - `TrafficTrendItem`: `{ date: string; label: string; upload_traffic: number; download_traffic: number; total_traffic: number }`
 - `TrafficSummary`: `{ weekly: { week_upload: number; week_download: number; week_total: number; active_days: number }; monthly: { month_upload: number; month_download: number; month_total: number; active_days: number }; peak: { record_date: string; total_traffic: number; upload_traffic: number; download_traffic: number } | null }`

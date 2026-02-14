@@ -20,6 +20,7 @@ import { GiftCardService, GiftCardType, CreateGiftCardPayload } from "../service
 import { CouponService } from "../services/couponService";
 import { ReferralService } from "../services/referralService";
 import { getLogger, type Logger } from "../utils/logger";
+import { formatRemoteAccountIdForResponse, serializeRemoteAccountIdForDb } from "../utils/sharedIds";
 
 interface AdminAuthResult {
   success: boolean;
@@ -326,7 +327,7 @@ interface SharedIdRow {
   id: number;
   name: string | null;
   fetch_url: string | null;
-  remote_account_id: number | null;
+  remote_account_id: unknown;
   status: number | null;
   created_at?: string | null;
   updated_at?: string | null;
@@ -336,7 +337,7 @@ type SharedIdRecord = {
   id: number;
   name: string;
   fetch_url: string;
-  remote_account_id: number;
+  remote_account_id: number | number[];
   status: number;
   created_at?: string | null;
   updated_at?: string | null;
@@ -432,7 +433,7 @@ export class AdminAPI {
       id: ensureNumber(row.id),
       name: ensureString(row.name),
       fetch_url: ensureString(row.fetch_url),
-      remote_account_id: ensureNumber(row.remote_account_id),
+      remote_account_id: formatRemoteAccountIdForResponse(row.remote_account_id),
       status: ensureNumber(row.status),
       created_at: row.created_at,
       updated_at: row.updated_at,
@@ -5072,7 +5073,7 @@ export class AdminAPI {
       const body = (await request.json()) as Record<string, unknown>;
       const name = typeof body.name === "string" ? body.name.trim() : "";
       const fetchUrl = typeof body.fetch_url === "string" ? body.fetch_url.trim() : "";
-      const remoteAccountId = ensureNumber(body.remote_account_id, NaN);
+      let remoteAccountIdValue = "";
       const statusValue =
         body.status === undefined || body.status === null
           ? 1
@@ -5095,8 +5096,11 @@ export class AdminAPI {
         return errorResponse("苹果账号获取URL格式不正确", 400);
       }
 
-      if (!Number.isFinite(remoteAccountId)) {
-        return errorResponse("苹果账号编号必须是数字", 400);
+      try {
+        remoteAccountIdValue = serializeRemoteAccountIdForDb(body.remote_account_id);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "远程账号 ID 格式不正确";
+        return errorResponse(message, 400);
       }
 
       const duplicate = await this.db.db
@@ -5115,7 +5119,7 @@ export class AdminAPI {
             VALUES (?, ?, ?, ?)
           `
           )
-          .bind(name, normalizedUrl, remoteAccountId, statusValue)
+          .bind(name, normalizedUrl, remoteAccountIdValue, statusValue)
           .run()
       );
 
@@ -5200,12 +5204,15 @@ export class AdminAPI {
       }
 
       if (body.remote_account_id !== undefined) {
-        const remoteAccountId = ensureNumber(body.remote_account_id, NaN);
-        if (!Number.isFinite(remoteAccountId)) {
-          return errorResponse("苹果账号编号必须是数字", 400);
+        let remoteAccountIdValue = "";
+        try {
+          remoteAccountIdValue = serializeRemoteAccountIdForDb(body.remote_account_id);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "远程账号 ID 格式不正确";
+          return errorResponse(message, 400);
         }
         updateFields.push("remote_account_id = ?");
-        updateValues.push(remoteAccountId);
+        updateValues.push(remoteAccountIdValue);
       }
 
       if (body.status !== undefined) {

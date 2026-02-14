@@ -10,6 +10,10 @@ import { TicketService } from "../../services/ticket";
 import { UserAuditService } from "../../services/userAudit";
 import { TwoFactorService } from "../../services/twoFactor";
 import { ensureNumber, ensureString } from "../../utils/d1";
+import {
+  formatRemoteAccountIdForResponse,
+  parseRemoteAccountIdList,
+} from "../../utils/sharedIds";
 
 export function createUserRouter(ctx: AppContext) {
   const router = Router();
@@ -1171,16 +1175,18 @@ export function createUserRouter(ctx: AppContext) {
       id: number;
       name: string | null;
       fetch_url: string | null;
-      remote_account_id: number | null;
+      remote_account_id: unknown;
       status: number | null;
     };
 
     type SharedIdPayload = {
       id: number;
       name: string;
-      remote_account_id: number;
+      remote_account_id: number | number[];
       status: "ok" | "missing" | "error";
       account: unknown;
+      accounts?: unknown[];
+      missing_ids?: number[];
       fetched_at?: string;
       message?: string | null;
       error?: string;
@@ -1201,22 +1207,35 @@ export function createUserRouter(ctx: AppContext) {
 
     const fetchAccount = async (record: SharedIdRow): Promise<SharedIdPayload> => {
       const id = toNumber(record.id);
+      const remoteAccountIds = parseRemoteAccountIdList(record.remote_account_id);
       const base: SharedIdPayload = {
         id,
         name: toText(record.name),
-        remote_account_id: toNumber(record.remote_account_id),
+        remote_account_id: formatRemoteAccountIdForResponse(record.remote_account_id),
         status: "error",
         account: null,
+        accounts: [],
         error: undefined
       };
+
+      if (remoteAccountIds.length === 0) {
+        return {
+          ...base,
+          status: "error",
+          fetched_at: new Date().toISOString(),
+          account: null,
+          accounts: [],
+          error: "未配置远程账号 ID"
+        };
+      }
 
       if (!record.fetch_url) {
         return {
           ...base,
-          status: "missing",
+          status: "error",
           fetched_at: new Date().toISOString(),
           message: "未配置拉取地址",
-          error: "未配置拉取地址"
+          error: "苹果账号未配置拉取地址"
         };
       }
 
@@ -1238,13 +1257,23 @@ export function createUserRouter(ctx: AppContext) {
         const rawAccounts = (payload as { accounts?: unknown }).accounts;
         const accounts = Array.isArray(rawAccounts) ? rawAccounts : [];
 
-        const matched =
-          accounts.find((item) => {
-            const rowObj = item as Record<string, unknown>;
-            return Number(rowObj?.id) === toNumber(record.remote_account_id);
-          }) ?? null;
+        const matchedAccounts: unknown[] = [];
+        const missingIds: number[] = [];
 
-        const isMatched = Boolean(matched);
+        for (const remoteId of remoteAccountIds) {
+          const matched =
+            accounts.find((item) => {
+              const rowObj = item as Record<string, unknown>;
+              return Number(rowObj?.id) === remoteId;
+            }) ?? null;
+          if (matched) {
+            matchedAccounts.push(matched);
+          } else {
+            missingIds.push(remoteId);
+          }
+        }
+
+        const isMatched = matchedAccounts.length > 0;
         const message =
           toText((payload as { msg?: unknown }).msg) ||
           toText((payload as { message?: unknown }).message);
@@ -1253,7 +1282,9 @@ export function createUserRouter(ctx: AppContext) {
           ...base,
           status: isMatched ? "ok" : "missing",
           fetched_at: new Date().toISOString(),
-          account: matched,
+          account: matchedAccounts[0] ?? null,
+          accounts: matchedAccounts,
+          missing_ids: missingIds.length ? missingIds : undefined,
           message,
           error: isMatched ? undefined : "未找到匹配的ID"
         };

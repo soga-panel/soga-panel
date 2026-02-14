@@ -250,9 +250,11 @@ export const getUserRechargeRecords = (params?: {
 export interface SharedIdItem {
   id: number;
   name: string;
-  remote_account_id: number;
+  remote_account_id: number | number[];
   status: 'ok' | 'missing' | 'error';
   account: Record<string, unknown> | null;
+  accounts?: Record<string, unknown>[];
+  missing_ids?: number[];
   fetched_at?: string;
   message?: string | null;
   error?: string;

@@ -11,6 +11,7 @@ import { ensureNumber, ensureString } from "../utils/d1";
 import { TwoFactorService } from "../services/twoFactor";
 import { ReferralService } from "../services/referralService";
 import { getLogger, type Logger } from "../utils/logger";
+import { formatRemoteAccountIdForResponse, parseRemoteAccountIdList } from "../utils/sharedIds";
 
 type AuthenticatedUser = {
   id: number;
@@ -33,15 +34,17 @@ type SharedIdRow = {
   id: number;
   name: string | null;
   fetch_url: string | null;
-  remote_account_id: number | null;
+  remote_account_id: unknown;
 };
 
 type SharedIdPayload = {
   id: number;
   name: string;
-  remote_account_id: number;
+  remote_account_id: number | number[];
   status: "ok" | "missing" | "error";
   account: unknown;
+  accounts?: unknown[];
+  missing_ids?: number[];
   fetched_at?: string;
   message?: string | null;
   error?: string;
@@ -941,14 +944,26 @@ export class UserAPI {
       return cached;
     }
 
+    const remoteAccountIds = parseRemoteAccountIdList(record.remote_account_id);
     const baseInfo: SharedIdPayload = {
       id,
       name: toString(record.name),
-      remote_account_id: toNumber(record.remote_account_id),
+      remote_account_id: formatRemoteAccountIdForResponse(record.remote_account_id),
       status: "error",
       account: null,
+      accounts: [],
       error: undefined,
     };
+
+    if (remoteAccountIds.length === 0) {
+      const result: SharedIdPayload = {
+        ...baseInfo,
+        status: "error",
+        error: "未配置远程账号 ID",
+      };
+      this.cache.memoryCache.set(cacheKey, result, 30);
+      return result;
+    }
 
     if (!record.fetch_url) {
       const result: SharedIdPayload = {
@@ -979,16 +994,27 @@ export class UserAPI {
       const rawAccounts = (payload as { accounts?: unknown }).accounts;
       const accounts = Array.isArray(rawAccounts) ? rawAccounts : [];
 
-      const matched =
-        accounts.find((item) => Number((item as Record<string, unknown>)?.id) === toNumber(record.remote_account_id)) ??
-        null;
+      const matchedAccounts: unknown[] = [];
+      const missingIds: number[] = [];
 
-      const isMatched = Boolean(matched);
+      for (const remoteId of remoteAccountIds) {
+        const matched =
+          accounts.find((item) => Number((item as Record<string, unknown>)?.id) === remoteId) ?? null;
+        if (matched) {
+          matchedAccounts.push(matched);
+        } else {
+          missingIds.push(remoteId);
+        }
+      }
+
+      const isMatched = matchedAccounts.length > 0;
       const result: SharedIdPayload = {
         ...baseInfo,
         status: isMatched ? "ok" : "missing",
         fetched_at: new Date().toISOString(),
-        account: matched,
+        account: matchedAccounts[0] ?? null,
+        accounts: matchedAccounts,
+        missing_ids: missingIds.length ? missingIds : undefined,
         message:
           toString((payload as { msg?: unknown }).msg) ||
           toString((payload as { message?: unknown }).message),

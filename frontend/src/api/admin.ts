@@ -430,7 +430,7 @@ export interface SharedIdConfig {
   id: number;
   name: string;
   fetch_url: string;
-  remote_account_id: number;
+  remote_account_id: number | number[];
   status: number;
   created_at?: string;
   updated_at?: string;
@@ -456,7 +456,7 @@ export const getSharedIdConfigs = (params?: {
 export const createSharedIdConfig = (data: {
   name: string;
   fetch_url: string;
-  remote_account_id: number;
+  remote_account_id: number | number[];
   status?: number;
 }): Promise<ApiResponse<{ record: SharedIdConfig }>> => {
   return http.post("/admin/shared-ids", data);
@@ -467,7 +467,7 @@ export const updateSharedIdConfig = (
   data: {
     name?: string;
     fetch_url?: string;
-    remote_account_id?: number;
+    remote_account_id?: number | number[];
     status?: number;
   }
 ): Promise<ApiResponse<{ record: SharedIdConfig }>> => {

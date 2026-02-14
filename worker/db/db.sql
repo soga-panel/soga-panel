@@ -502,14 +502,14 @@ CREATE TABLE IF NOT EXISTS passkeys (
 -- id: 主键
 -- name: 共享ID名称，展示给用户
 -- fetch_url: 需要代理获取的远程JSON地址
--- remote_account_id: 远程JSON中的账户ID
+-- remote_account_id: 远程JSON中的账户ID（支持单个ID或ID数组：JSON/逗号分隔）
 -- status: 状态（1启用，0禁用）
 -- created_at/updated_at: 记录创建与更新时间（UTC+8）
 CREATE TABLE IF NOT EXISTS shared_ids (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     fetch_url TEXT NOT NULL,
-    remote_account_id INTEGER NOT NULL,
+    remote_account_id TEXT NOT NULL,
     status INTEGER DEFAULT 1,
     created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
     updated_at DATETIME DEFAULT (datetime('now', '+8 hours'))

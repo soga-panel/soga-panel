@@ -14,6 +14,10 @@ use urlencoding::encode;
 use crate::crypto::{hash_password, random_string, sha256_hex, verify_password};
 use crate::referral::{ensure_user_invite_code_with_length, regenerate_invite_code};
 use crate::response::{error, success};
+use crate::shared_ids::{
+  format_remote_account_id_for_response_text,
+  parse_remote_account_id_list_text
+};
 use crate::state::AppState;
 use crate::totp::verify_totp;
 
@@ -3230,16 +3234,28 @@ struct SharedIdRow {
   id: i64,
   name: String,
   fetch_url: Option<String>,
-  remote_account_id: i64
+  remote_account_id: String
 }
 
 impl SharedIdRow {
   fn from_row(row: &sqlx::mysql::MySqlRow) -> Self {
+    let remote_account_id = row
+      .try_get::<Option<String>, _>("remote_account_id")
+      .ok()
+      .flatten()
+      .or_else(|| {
+        row
+          .try_get::<Option<i64>, _>("remote_account_id")
+          .ok()
+          .flatten()
+          .map(|value| value.to_string())
+      })
+      .unwrap_or_default();
     Self {
       id: row.try_get::<i64, _>("id").unwrap_or(0),
       name: row.try_get::<Option<String>, _>("name").ok().flatten().unwrap_or_default(),
       fetch_url: row.try_get::<Option<String>, _>("fetch_url").ok().flatten(),
-      remote_account_id: row.try_get::<Option<i64>, _>("remote_account_id").unwrap_or(Some(0)).unwrap_or(0)
+      remote_account_id
     }
   }
 }
@@ -3252,21 +3268,32 @@ async fn fetch_shared_id(client: &reqwest::Client, record: SharedIdRow) -> Value
     remote_account_id
   } = record;
   let now = Utc::now().to_rfc3339();
+  let remote_account_ids = parse_remote_account_id_list_text(&remote_account_id);
   let mut value = json!({
     "id": id,
     "name": name,
-    "remote_account_id": remote_account_id,
+    "remote_account_id": format_remote_account_id_for_response_text(&remote_account_id),
     "status": "error",
-    "account": null
+    "account": null,
+    "accounts": []
   });
+
+  if remote_account_ids.is_empty() {
+    if let Some(obj) = value.as_object_mut() {
+      obj.insert("status".to_string(), json!("error"));
+      obj.insert("fetched_at".to_string(), json!(now));
+      obj.insert("error".to_string(), json!("未配置远程账号 ID"));
+    }
+    return value;
+  }
 
   let fetch_url = fetch_url.unwrap_or_default();
   if fetch_url.trim().is_empty() {
     if let Some(obj) = value.as_object_mut() {
-      obj.insert("status".to_string(), json!("missing"));
+      obj.insert("status".to_string(), json!("error"));
       obj.insert("fetched_at".to_string(), json!(now));
       obj.insert("message".to_string(), json!("未配置拉取地址"));
-      obj.insert("error".to_string(), json!("未配置拉取地址"));
+      obj.insert("error".to_string(), json!("苹果账号未配置拉取地址"));
     }
     return value;
   }
@@ -3323,25 +3350,40 @@ async fn fetch_shared_id(client: &reqwest::Client, record: SharedIdRow) -> Value
     .and_then(Value::as_array)
     .cloned()
     .unwrap_or_default();
-  let matched = accounts.iter().find(|item| {
-    if let Some(obj) = item.as_object() {
-      obj.get("id").map(parse_value_id).unwrap_or(0) == remote_account_id
+  let mut matched_accounts: Vec<Value> = Vec::new();
+  let mut missing_ids: Vec<i64> = Vec::new();
+  for remote_id in &remote_account_ids {
+    let matched = accounts.iter().find(|item| {
+      if let Some(obj) = item.as_object() {
+        obj.get("id").map(parse_value_id).unwrap_or(0) == *remote_id
+      } else {
+        parse_value_id(item) == *remote_id
+      }
+    });
+    if let Some(account) = matched {
+      matched_accounts.push(account.clone());
     } else {
-      parse_value_id(item) == remote_account_id
+      missing_ids.push(*remote_id);
     }
-  });
+  }
 
   if let Some(obj) = value.as_object_mut() {
     obj.insert("fetched_at".to_string(), json!(now));
     if let Some(msg) = message.clone() {
       obj.insert("message".to_string(), json!(msg));
     }
-    if let Some(account) = matched {
+    if !matched_accounts.is_empty() {
       obj.insert("status".to_string(), json!("ok"));
-      obj.insert("account".to_string(), account.clone());
+      obj.insert("account".to_string(), matched_accounts.first().cloned().unwrap_or(Value::Null));
+      obj.insert("accounts".to_string(), json!(matched_accounts));
+      if !missing_ids.is_empty() {
+        obj.insert("missing_ids".to_string(), json!(missing_ids));
+      }
     } else {
       obj.insert("status".to_string(), json!("missing"));
       obj.insert("account".to_string(), Value::Null);
+      obj.insert("accounts".to_string(), json!([]));
+      obj.insert("missing_ids".to_string(), json!(remote_account_ids));
       obj.insert("error".to_string(), json!("未找到匹配的ID"));
     }
   }

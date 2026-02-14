@@ -1119,7 +1119,7 @@ export class DatabaseService {
     return rows.results || [];
   }
 
-  async createSharedId(params: { name: string; fetchUrl: string; remoteAccountId: number; status?: number }) {
+  async createSharedId(params: { name: string; fetchUrl: string; remoteAccountId: string; status?: number }) {
     await this.db.db
       .prepare(
         `
@@ -1131,7 +1131,7 @@ export class DatabaseService {
       .run();
   }
 
-  async updateSharedId(id: number, params: Partial<{ name: string; fetchUrl: string; remoteAccountId: number; status: number }>) {
+  async updateSharedId(id: number, params: Partial<{ name: string; fetchUrl: string; remoteAccountId: string; status: number }>) {
     const fields: string[] = [];
     const values: any[] = [];
     if (params.name !== undefined) {

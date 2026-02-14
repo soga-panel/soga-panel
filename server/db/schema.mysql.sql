@@ -287,12 +287,12 @@ CREATE TABLE IF NOT EXISTS shared_ids (
   id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '共享账号 ID',
   name VARCHAR(255) NOT NULL COMMENT '共享账号名称',
   fetch_url TEXT NOT NULL COMMENT '远程拉取地址',
-  remote_account_id BIGINT NOT NULL COMMENT '远程账号 ID',
+  remote_account_id TEXT NOT NULL COMMENT '远程账号 ID（支持单个ID或ID数组：JSON/CSV）',
   status TINYINT DEFAULT 1 COMMENT '状态（1 可用）',
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   INDEX idx_shared_ids_status (status),
-  INDEX idx_shared_ids_remote_id (remote_account_id)
+  INDEX idx_shared_ids_remote_id (remote_account_id(255))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS packages (

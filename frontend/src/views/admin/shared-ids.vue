@@ -64,6 +64,9 @@
               {{ row.status === 1 ? '启用' : '禁用' }}
             </el-tag>
           </template>
+          <template #remote_ids="{ row }">
+            <span>{{ formatRemoteAccountId(row.remote_account_id) }}</span>
+          </template>
           <template #updated_at="{ row }"><span>{{ formatTime(row.updated_at) }}</span></template>
           <template #actions="{ row }">
             <div class="table-actions">
@@ -84,7 +87,14 @@
           <el-input v-model="form.fetch_url" placeholder="https://example.com/accounts.json" />
         </el-form-item>
         <el-form-item label="远程账号 ID" prop="remote_account_id">
-          <el-input-number v-model="form.remote_account_id" :min="1" :controls="false" style="width: 100%;" />
+          <el-input
+            v-model="form.remote_account_id"
+            placeholder="示例：53 或 [53,56,55]"
+            clearable
+          />
+          <div class="form-help">
+            支持填写单个数字 ID，或 JSON 数组（也兼容逗号分隔，如：53,56,55）。
+          </div>
         </el-form-item>
         <el-form-item label="状态">
           <el-switch v-model="form.status" :active-value="1" :inactive-value="0" />
@@ -141,7 +151,7 @@ const columns: VxeTableBarColumns = [
   { field: 'id', title: 'ID', width: 80, visible: true },
   { field: 'name', title: '名称', minWidth: 180, visible: true, slots: { default: 'name' } },
   { field: 'fetch_url', title: '拉取地址', minWidth: 260, visible: true, slots: { default: 'fetch_url' } },
-  { field: 'remote_account_id', title: '远程ID', width: 120, visible: true },
+  { field: 'remote_account_id', title: '远程ID', width: 160, visible: true, slots: { default: 'remote_ids' } },
   { field: 'status', title: '状态', width: 120, visible: true, slots: { default: 'status' } },
   { field: 'updated_at', title: '更新时间', width: 180, visible: true, slots: { default: 'updated_at' } },
   { field: 'actions', title: '操作', width: 200, fixed: 'right', visible: true, slots: { default: 'actions' }, columnSelectable: false }
@@ -154,9 +164,59 @@ const form = reactive({
   id: 0,
   name: "",
   fetch_url: "",
-  remote_account_id: 1,
+  remote_account_id: "1",
   status: 1,
 });
+
+const parseRemoteAccountIdInput = (raw: unknown): number | number[] => {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (!value) {
+    throw new Error("请输入远程 ID");
+  }
+
+  if (/^\d+$/.test(value)) {
+    const num = Number(value);
+    if (!Number.isSafeInteger(num) || num <= 0) {
+      throw new Error("远程 ID 需大于 0");
+    }
+    return num;
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (typeof parsed === "number") {
+      if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("远程 ID 需大于 0");
+      return parsed;
+    }
+    if (Array.isArray(parsed)) {
+      const ids = parsed
+        .map((item) => Number(item))
+        .filter((item) => Number.isSafeInteger(item) && item > 0);
+      const unique = Array.from(new Set(ids));
+      if (unique.length === 0) throw new Error("远程 ID 数组不能为空");
+      return unique.length === 1 ? unique[0] : unique;
+    }
+  } catch {
+    // fallthrough to CSV parse
+  }
+
+  const ids = value
+    .split(/[,，\s]+/g)
+    .map((item) => Number(item.trim()))
+    .filter((item) => Number.isSafeInteger(item) && item > 0);
+  const unique = Array.from(new Set(ids));
+  if (unique.length === 0) {
+    throw new Error("请输入数字 ID 或 ID 数组");
+  }
+  return unique.length === 1 ? unique[0] : unique;
+};
+
+const formatRemoteAccountId = (value: unknown): string => {
+  if (Array.isArray(value)) return value.filter((v) => v !== null && v !== undefined).join(", ");
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "-";
+  if (typeof value === "string") return value.trim() || "-";
+  return "-";
+};
 
 const rules: FormRules = {
   name: [
@@ -185,11 +245,13 @@ const rules: FormRules = {
     { required: true, message: "请输入远程 ID", trigger: "blur" },
     {
       validator: (_rule, value, callback) => {
-        if (!value || value <= 0) {
-          callback(new Error("远程 ID 需大于 0"));
-          return;
+        try {
+          parseRemoteAccountIdInput(value);
+          callback();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "远程 ID 格式不正确";
+          callback(new Error(message));
         }
-        callback();
       },
       trigger: "blur",
     },
@@ -236,7 +298,7 @@ const openCreate = () => {
     id: 0,
     name: "",
     fetch_url: "",
-    remote_account_id: 1,
+    remote_account_id: "1",
     status: 1,
   });
   dialogVisible.value = true;
@@ -244,7 +306,12 @@ const openCreate = () => {
 
 const openEdit = (record: SharedIdConfig) => {
   isEdit.value = true;
-  Object.assign(form, record);
+  Object.assign(form, {
+    ...record,
+    remote_account_id: Array.isArray(record.remote_account_id)
+      ? JSON.stringify(record.remote_account_id)
+      : String(record.remote_account_id ?? ""),
+  });
   dialogVisible.value = true;
 };
 
@@ -255,10 +322,11 @@ const handleSubmit = async () => {
 
   saving.value = true;
   try {
+    const remoteAccountId = parseRemoteAccountIdInput(form.remote_account_id);
     const payload = {
       name: form.name,
       fetch_url: form.fetch_url,
-      remote_account_id: form.remote_account_id,
+      remote_account_id: remoteAccountId,
       status: form.status,
     };
     if (isEdit.value && form.id) {
@@ -322,6 +390,13 @@ onMounted(fetchList);
   .table-actions {
     display: flex;
     gap: 8px;
+  }
+
+  .form-help {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #909399;
+    line-height: 1.4;
   }
 }
 </style>

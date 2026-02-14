@@ -49,35 +49,50 @@
                 <el-icon><Key /></el-icon>
                 <span>{{ item.name }}</span>
               </div>
-              <el-tag :type="getStatusTagType(item.status)" size="small">{{ getStatusText(item) }}</el-tag>
+              <el-tag :type="getStatusTagType(item)" size="small">{{ getStatusText(item) }}</el-tag>
             </div>
 
-            <div class="card-body" v-if="item.account && item.status === 'ok'">
-              <div class="info-row">
-                <span>账号</span>
-                <div class="value">
-                  <span>{{ getAccountField(item.account, 'username') }}</span>
-                  <el-button link size="small" @click="copyField(item.account, 'username')">复制</el-button>
+            <div class="card-body" v-if="item.status === 'ok' && getAccountList(item).length > 0">
+              <div v-if="item.missing_ids?.length" class="missing-tip">
+                未匹配 ID：{{ item.missing_ids.join(', ') }}
+              </div>
+              <div
+                class="account-block"
+                v-for="(account, index) in getAccountList(item)"
+                :key="index"
+              >
+                <div class="account-title" v-if="getAccountList(item).length > 1">
+                  <span>账号 {{ index + 1 }}</span>
+                  <span class="account-id" v-if="getAccountField(account, 'id') !== '-'">
+                    ID：{{ getAccountField(account, 'id') }}
+                  </span>
                 </div>
-              </div>
-              <div class="info-row">
-                <span>密码</span>
-                <div class="value">
-                  <span class="password">********</span>
-                  <el-button link size="small" @click="copyField(item.account, 'password')">复制</el-button>
+                <div class="info-row">
+                  <span>账号</span>
+                  <div class="value">
+                    <span>{{ getAccountField(account, 'username') }}</span>
+                    <el-button link size="small" @click="copyField(account, 'username')">复制</el-button>
+                  </div>
                 </div>
-              </div>
-              <div class="info-row" v-if="getAccountField(item.account, 'region_display') !== '-'">
-                <span>区域</span>
-                <div class="value">{{ getAccountField(item.account, 'region_display') }}</div>
-              </div>
-              <div class="info-row" v-if="getAccountField(item.account, 'message') !== '-'">
-                <span>状态</span>
-                <div class="value">{{ getAccountField(item.account, 'message') }}</div>
-              </div>
-              <div class="info-row" v-if="getAccountField(item.account, 'last_check') !== '-'">
-                <span>最近检测</span>
-                <div class="value">{{ getAccountField(item.account, 'last_check') }}</div>
+                <div class="info-row">
+                  <span>密码</span>
+                  <div class="value">
+                    <span class="password">********</span>
+                    <el-button link size="small" @click="copyField(account, 'password')">复制</el-button>
+                  </div>
+                </div>
+                <div class="info-row" v-if="getAccountField(account, 'region_display') !== '-'">
+                  <span>区域</span>
+                  <div class="value">{{ getAccountField(account, 'region_display') }}</div>
+                </div>
+                <div class="info-row" v-if="getAccountField(account, 'message') !== '-'">
+                  <span>状态</span>
+                  <div class="value">{{ getAccountField(account, 'message') }}</div>
+                </div>
+                <div class="info-row" v-if="getAccountField(account, 'last_check') !== '-'">
+                  <span>最近检测</span>
+                  <div class="value">{{ getAccountField(account, 'last_check') }}</div>
+                </div>
               </div>
             </div>
 
@@ -125,8 +140,9 @@ const fetchSharedIds = async () => {
   }
 };
 
-const getStatusTagType = (status: SharedIdItem["status"]) => {
-  switch (status) {
+const getStatusTagType = (item: SharedIdItem) => {
+  if (item.status === "ok" && item.missing_ids?.length) return "warning";
+  switch (item.status) {
     case "ok":
       return "success";
     case "missing":
@@ -137,9 +153,15 @@ const getStatusTagType = (status: SharedIdItem["status"]) => {
 };
 
 const getStatusText = (item: SharedIdItem) => {
-  if (item.status === "ok") return "可用";
+  if (item.status === "ok") return item.missing_ids?.length ? "部分可用" : "可用";
   if (item.status === "missing") return "未匹配";
   return "拉取失败";
+};
+
+const getAccountList = (item: SharedIdItem): Record<string, unknown>[] => {
+  if (Array.isArray(item.accounts) && item.accounts.length > 0) return item.accounts;
+  if (item.account) return [item.account];
+  return [];
 };
 
 const getAccountField = (account: Record<string, unknown> | null, key: string): string => {
@@ -304,12 +326,37 @@ onMounted(fetchSharedIds);
       }
     }
 
-    .card-body {
-      .info-row {
-        display: flex;
-        justify-content: space-between;
-        padding: 6px 0;
-        font-size: 14px;
+	    .card-body {
+	      .missing-tip {
+	        margin-bottom: 10px;
+	        font-size: 12px;
+	        color: #e6a23c;
+	      }
+
+	      .account-block + .account-block {
+	        margin-top: 12px;
+	        padding-top: 12px;
+	        border-top: 1px dashed rgba(144, 147, 153, 0.35);
+	      }
+
+	      .account-title {
+	        display: flex;
+	        justify-content: space-between;
+	        align-items: center;
+	        margin-bottom: 6px;
+	        font-size: 12px;
+	        color: #606266;
+
+	        .account-id {
+	          color: #909399;
+	        }
+	      }
+
+	      .info-row {
+	        display: flex;
+	        justify-content: space-between;
+	        padding: 6px 0;
+	        font-size: 14px;
 
         .value {
           display: flex;

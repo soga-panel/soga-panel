@@ -8,6 +8,7 @@ mod passkey;
 mod payment;
 mod response;
 mod referral;
+mod shared_ids;
 mod routes;
 mod state;
 mod subscription;

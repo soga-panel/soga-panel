@@ -216,7 +216,7 @@
 - GET `/api/user/shared-ids`
   - 请求头：`Authorization`
   - 请求参数：无
-  - 返回参数（data）：`items[]`（`id`,`name`,`remote_account_id`,`status`,`account`,`fetched_at?`,`message?`,`error?`）, `count`
+  - 返回参数（data）：`items[]`（`id`,`name`,`remote_account_id`(number|number[]),`status`,`account`,`accounts?`,`missing_ids?`,`fetched_at?`,`message?`,`error?`）, `count`
 - GET `/api/user/audit-rules`
   - 请求头：`Authorization`
   - 请求参数：`page?`, `limit?`, `action?`, `search?`
@@ -599,12 +599,12 @@
 ### 共享ID（苹果账号）
 - GET `/api/admin/shared-ids`
   - 请求参数：`page?`, `limit?`, `keyword?`, `status?`
-  - 返回参数（data）：`records[]`（`id`,`name`,`fetch_url`,`remote_account_id`,`status`,`created_at`,`updated_at`）, `pagination`
+  - 返回参数（data）：`records[]`（`id`,`name`,`fetch_url`,`remote_account_id`(number|number[]),`status`,`created_at`,`updated_at`）, `pagination`
 - POST `/api/admin/shared-ids`
-  - 请求体：`name`, `fetch_url`, `remote_account_id`, `status?`
+  - 请求体：`name`, `fetch_url`, `remote_account_id`(number|number[]), `status?`
   - 返回参数（data）：`message`, `record`
 - PUT `/api/admin/shared-ids/:id`
-  - 请求体：`name?`, `fetch_url?`, `remote_account_id?`, `status?`
+  - 请求体：`name?`, `fetch_url?`, `remote_account_id?`(number|number[]), `status?`
   - 返回参数（data）：`message`, `record`
 - DELETE `/api/admin/shared-ids/:id`
   - 返回参数（data）：`message`, `id`
