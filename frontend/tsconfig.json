@@ -25,7 +25,6 @@
     "sourceMap": true,
     "declaration": false,
     "declarationMap": false,
-    "baseUrl": ".",
     "allowJs": true,
     "resolveJsonModule": true,
     "useDefineForClassFields": true,
@@ -36,10 +35,10 @@
     ],
     "paths": {
       "@/*": [
-        "src/*"
+        "./src/*"
       ],
       "@build/*": [
-        "build/*"
+        "./build/*"
       ]
     },
     "types": [
