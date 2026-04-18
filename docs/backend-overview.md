@@ -105,6 +105,16 @@ wrangler d1 execute soga-panel-d1 --command="SELECT * FROM users LIMIT 5" --remo
 curl https://your-worker.workers.dev/api/admin/traffic/overview -H "Authorization: Bearer <token>"
 ```
 
+## telegram bot webhook
+```
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url":"https://你的面板域名/api/telegram/webhook",
+    "secret_token":"<telegram_webhook_secret>"
+  }'
+```
+
 ## 安全建议
 
 - 使用强密码或随机字符串作为 `JWT_SECRET`、`WEBAPI_KEY`
