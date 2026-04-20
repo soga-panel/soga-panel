@@ -71,18 +71,29 @@ export default defineConfig(({ mode }) => {
           chunkFileNames: "js/[name]-[hash].js",
           entryFileNames: "js/[name]-[hash].js",
           assetFileNames: "[ext]/[name]-[hash].[ext]",
-          manualChunks: {
-            vendor: ['vue', 'vue-router', 'pinia'],
-            echarts: ['echarts', 'vue-echarts'],
-            ui: ['element-plus']
+          manualChunks: (id: string) => {
+            if (!id.includes("/node_modules/")) {
+              return;
+            }
+
+            if (id.includes("/echarts/") || id.includes("/vue-echarts/")) {
+              return "echarts";
+            }
+
+            if (id.includes("/element-plus/")) {
+              return "ui";
+            }
+
+            if (
+              id.includes("/vue/") ||
+              id.includes("/vue-router/") ||
+              id.includes("/pinia/")
+            ) {
+              return "vendor";
+            }
           }
         }
       }
-    },
-    
-    // CSP 相关配置
-    esbuild: {
-      legalComments: 'none',
     },
     
     define: {
