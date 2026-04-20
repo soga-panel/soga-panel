@@ -1099,6 +1099,9 @@ export function generateQuantumultXConfig(nodes, user) {
       case "ss":
         line = buildQuantumultXSSEntry({ ...node, server, server_port: port, tls_host: tlsHost }, config, user);
         break;
+      case "anytls":
+        line = buildQuantumultXAnyTLSEntry({ ...node, server, server_port: port, tls_host: tlsHost }, config, user, client);
+        break;
       default:
         line = "";
     }
@@ -1207,6 +1210,28 @@ function buildQuantumultXTrojanEntry(node, config, user) {
 
   pushOption(options, "tag", node.name);
   return formatQuantumultXEntry("trojan", node.server, node.server_port, options);
+}
+
+function buildQuantumultXAnyTLSEntry(node, config, user, client) {
+  const options = [];
+  pushOption(options, "password", ensureString(user.passwd || config.password, ""));
+  pushOption(options, "over-tls", true);
+  pushOption(options, "tls-host", getHeaderHost(node, config));
+
+  if (config.tls_type === "reality") {
+    const publicKey = resolveRealityPublicKey(config, client);
+    if (publicKey) {
+      pushOption(options, "reality-base64-pubkey", publicKey);
+    }
+    const shortId = pickRandomShortId(config.short_ids);
+    if (shortId) {
+      pushOption(options, "reality-hex-shortid", shortId);
+    }
+  }
+
+  pushOption(options, "udp-relay", true);
+  pushOption(options, "tag", node.name);
+  return formatQuantumultXEntry("anytls", node.server, node.server_port, options);
 }
 
 function applyStreamOptions(options, node, config) {

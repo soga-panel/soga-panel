@@ -2930,6 +2930,46 @@ fn build_quantumultx_trojan_entry(
     format_quantumultx_entry("trojan", server, port, &options)
 }
 
+fn build_quantumultx_anytls_entry(
+    name: &str,
+    server: &str,
+    port: i64,
+    tls_host: &str,
+    config: &Value,
+    user: &SubscriptionUser,
+    client: &Value,
+) -> String {
+    let mut options: Vec<String> = Vec::new();
+    let user_password = user.passwd.clone().unwrap_or_default();
+    let password = if !user_password.is_empty() {
+        user_password
+    } else {
+        resolve_config_string(config, &["password"])
+    };
+    options.push(format!("password={password}"));
+    options.push("over-tls=true".to_string());
+
+    let host = get_header_host(server, tls_host, config);
+    if !host.is_empty() {
+        options.push(format!("tls-host={host}"));
+    }
+
+    if ensure_string(config.get("tls_type")) == "reality" {
+        let public_key = resolve_reality_public_key(config, client);
+        if !public_key.is_empty() {
+            options.push(format!("reality-base64-pubkey={public_key}"));
+        }
+        let short_id = pick_random_short_id(config.get("short_ids"));
+        if !short_id.is_empty() {
+            options.push(format!("reality-hex-shortid={short_id}"));
+        }
+    }
+
+    options.push("udp-relay=true".to_string());
+    options.push(format!("tag={name}"));
+    format_quantumultx_entry("anytls", server, port, &options)
+}
+
 pub fn generate_quantumultx_config(nodes: &[SubscriptionNode], user: &SubscriptionUser) -> String {
     let mut entries: Vec<String> = Vec::new();
     for node in nodes {
@@ -2955,6 +2995,9 @@ pub fn generate_quantumultx_config(nodes: &[SubscriptionNode], user: &Subscripti
                 build_quantumultx_trojan_entry(&name, &server, port, &tls_host, &config, user)
             }
             "ss" => build_quantumultx_ss_entry(&name, &server, port, &tls_host, &config, user),
+            "anytls" => build_quantumultx_anytls_entry(
+                &name, &server, port, &tls_host, &config, user, &client,
+            ),
             _ => String::new(),
         };
         if !line.is_empty() {
