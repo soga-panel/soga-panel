@@ -123,6 +123,37 @@ const hasMore = ref(true);
 const offset = ref(0);
 const limit = 10;
 
+const getAnnouncementSortKey = (announcement: Announcement): number => {
+  const rawCreatedAt = (announcement as { created_at?: unknown }).created_at;
+  if (typeof rawCreatedAt === "number" && Number.isFinite(rawCreatedAt)) {
+    return rawCreatedAt;
+  }
+
+  const numericValue = Number(rawCreatedAt);
+  if (Number.isFinite(numericValue)) {
+    return numericValue;
+  }
+
+  if (typeof rawCreatedAt === "string") {
+    const parsedMs = Date.parse(rawCreatedAt);
+    if (Number.isFinite(parsedMs)) {
+      return Math.floor(parsedMs / 1000);
+    }
+  }
+
+  return 0;
+};
+
+const sortAnnouncementsByLatest = (items: Announcement[]): Announcement[] => {
+  return [...items].sort((a, b) => {
+    const createdAtDiff = getAnnouncementSortKey(b) - getAnnouncementSortKey(a);
+    if (createdAtDiff !== 0) {
+      return createdAtDiff;
+    }
+    return b.id - a.id;
+  });
+};
+
 const renderAnnouncementContent = (announcement: Announcement): string => {
   const markdown = (announcement.content || '').trim();
   if (markdown) {
@@ -153,13 +184,16 @@ const loadAnnouncements = async (isLoadMore = false) => {
     const filteredData = data.filter((announcement: Announcement) => !announcement.is_pinned);
 
     if (isLoadMore) {
-      announcements.value.push(...filteredData);
+      announcements.value = sortAnnouncementsByLatest([
+        ...announcements.value,
+        ...filteredData
+      ]);
     } else {
-      announcements.value = filteredData;
+      announcements.value = sortAnnouncementsByLatest(filteredData);
     }
 
     // 如果返回的数据少于限制数量，说明没有更多了
-    hasMore.value = filteredData.length === limit;
+    hasMore.value = data.length === limit;
     offset.value += data.length;
 
   } catch (err: any) {
