@@ -30,6 +30,7 @@ use crate::templates::email_templates::{
 const TELEGRAM_BIND_CODE_MIN_LEN: usize = 8;
 const TELEGRAM_BIND_CODE_MAX_LEN: usize = 64;
 const LINK_CALLBACK_PREFIX: &str = "link:";
+const NOTIFY_CALLBACK_PREFIX: &str = "notify:";
 const REGISTER_CAPTCHA_CALLBACK_PREFIX: &str = "regcap:";
 const REGISTER_CAPTCHA_TTL_SECONDS: i64 = 10 * 60;
 const REGISTER_SESSION_TTL_SECONDS: i64 = 30 * 60;
@@ -112,6 +113,7 @@ struct BoundTelegramUser {
     download_today: i64,
     status: i64,
     token: String,
+    telegram_enabled: i64,
 }
 
 pub fn router() -> Router<AppState> {
@@ -216,6 +218,7 @@ async fn post_webhook(
         "info" => handle_info_command(&state, &config, &chat_id).await,
         "link" => handle_sublink_command(&state, &config, &chat_id).await,
         "panel" => handle_panel_command(&state, &config, &chat_id).await,
+        "notify" => handle_notify_command(&state, &config, &chat_id, &command.arg).await,
         "help" => handle_help_command(&config, &chat_id).await,
         _ => Ok(json!({ "ok": true, "skipped": "unsupported_command" })),
     };
@@ -234,6 +237,31 @@ async fn handle_start_command(
 ) -> Result<Value, String> {
     let bind_code = bind_code.trim();
     if bind_code.is_empty() {
+        if let Some(bound_user) = fetch_bound_user_by_chat_id(state, chat_id).await? {
+            let account_name = if bound_user.username.trim().is_empty() {
+                format!("#{}", bound_user.id)
+            } else {
+                bound_user.username
+            };
+            let _ = send_telegram_message(
+                config,
+                chat_id,
+                &[
+                    format!("当前 Telegram 已绑定账号：{}。", account_name),
+                    "可发送 /info 查看账号信息，/panel 打开面板，/notify 管理通知。".to_string(),
+                    "更多命令请发送 /help。".to_string(),
+                ]
+                .join("\n"),
+                None,
+            )
+            .await;
+            return Ok(json!({
+              "ok": true,
+              "skipped": "missing_bind_code_already_bound",
+              "user_id": bound_user.id
+            }));
+        }
+
         let _ = send_telegram_message(
             config,
             chat_id,
@@ -1093,6 +1121,71 @@ async fn handle_help_command(config: &TelegramBotConfig, chat_id: &str) -> Resul
     Ok(json!({ "ok": true, "command": "help" }))
 }
 
+async fn handle_notify_command(
+    state: &AppState,
+    config: &TelegramBotConfig,
+    chat_id: &str,
+    arg_text: &str,
+) -> Result<Value, String> {
+    let user = match fetch_bound_user_by_chat_id(state, chat_id).await? {
+        Some(value) => value,
+        None => {
+            let _ = send_telegram_message(
+                config,
+                chat_id,
+                "当前 Telegram 未绑定账号，请先在面板点击绑定并发送 /start 绑定码。",
+                None,
+            )
+            .await;
+            return Ok(json!({ "ok": true, "skipped": "not_bound" }));
+        }
+    };
+
+    let arg = arg_text.trim();
+    let current_enabled = user.telegram_enabled == 1;
+    if arg.is_empty() {
+        let _ = send_notify_status_message(config, chat_id, current_enabled).await;
+        return Ok(json!({
+          "ok": true,
+          "command": "notify_status",
+          "telegram_enabled": current_enabled
+        }));
+    }
+
+    let target_enabled = match parse_notify_command_arg(arg) {
+        Some(value) => value,
+        None => {
+            let _ = send_telegram_message(
+                config,
+                chat_id,
+                "参数无效。请发送 /notify on 开启通知，或发送 /notify off 关闭通知。",
+                None,
+            )
+            .await;
+            return Ok(json!({ "ok": true, "skipped": "notify_invalid_arg" }));
+        }
+    };
+
+    if target_enabled == current_enabled {
+        let _ = send_notify_status_message(config, chat_id, current_enabled).await;
+        return Ok(json!({
+          "ok": true,
+          "command": "notify_no_change",
+          "telegram_enabled": current_enabled
+        }));
+    }
+
+    update_telegram_notify_setting(state, user.id, target_enabled).await?;
+    let _ = send_notify_status_message(config, chat_id, target_enabled).await;
+
+    Ok(json!({
+      "ok": true,
+      "command": "notify_updated",
+      "telegram_enabled": target_enabled,
+      "user_id": user.id
+    }))
+}
+
 async fn handle_callback_query(
     state: &AppState,
     config: &TelegramBotConfig,
@@ -1116,6 +1209,10 @@ async fn handle_callback_query(
         .and_then(|chat| chat.get("id"))
         .and_then(value_to_chat_id)
         .unwrap_or_default();
+    let callback_message_id = callback_query
+        .get("message")
+        .and_then(|message| message.get("message_id"))
+        .and_then(value_to_message_id);
 
     if chat_id.is_empty() {
         if !callback_id.is_empty() {
@@ -1131,6 +1228,17 @@ async fn handle_callback_query(
             &chat_id,
             &callback_data,
             &callback_id,
+        )
+        .await;
+    }
+    if callback_data.starts_with(NOTIFY_CALLBACK_PREFIX) {
+        return handle_notify_callback(
+            state,
+            config,
+            &chat_id,
+            &callback_data,
+            &callback_id,
+            callback_message_id,
         )
         .await;
     }
@@ -1217,6 +1325,74 @@ async fn handle_callback_query(
       "ok": true,
       "command": "link_callback",
       "type": sub_type,
+      "user_id": user.id
+    }))
+}
+
+async fn handle_notify_callback(
+    state: &AppState,
+    config: &TelegramBotConfig,
+    chat_id: &str,
+    callback_data: &str,
+    callback_id: &str,
+    callback_message_id: Option<i64>,
+) -> Result<Value, String> {
+    let arg = callback_data
+        .strip_prefix(NOTIFY_CALLBACK_PREFIX)
+        .unwrap_or("")
+        .trim();
+    let target_enabled = match parse_notify_command_arg(arg) {
+        Some(value) => value,
+        None => {
+            if !callback_id.is_empty() {
+                let _ = answer_callback_query(config, callback_id, Some("按钮参数无效")).await;
+            }
+            return Ok(json!({ "ok": true, "skipped": "notify_invalid_callback_arg" }));
+        }
+    };
+
+    let user = match fetch_bound_user_by_chat_id(state, chat_id).await? {
+        Some(value) => value,
+        None => {
+            let _ = send_telegram_message(
+                config,
+                chat_id,
+                "当前 Telegram 未绑定账号，请先在面板点击绑定并发送 /start 绑定码。",
+                None,
+            )
+            .await;
+            if !callback_id.is_empty() {
+                let _ = answer_callback_query(config, callback_id, Some("当前未绑定账号")).await;
+            }
+            return Ok(json!({ "ok": true, "skipped": "not_bound" }));
+        }
+    };
+
+    if user.telegram_enabled != if target_enabled { 1 } else { 0 } {
+        update_telegram_notify_setting(state, user.id, target_enabled).await?;
+    }
+    if let Some(message_id) = callback_message_id {
+        let _ = delete_telegram_message(config, chat_id, message_id).await;
+    }
+    let _ = send_notify_status_message(config, chat_id, target_enabled).await;
+
+    if !callback_id.is_empty() {
+        let _ = answer_callback_query(
+            config,
+            callback_id,
+            Some(if target_enabled {
+                "已开启通知"
+            } else {
+                "已关闭通知"
+            }),
+        )
+        .await;
+    }
+
+    Ok(json!({
+      "ok": true,
+      "command": "notify_callback",
+      "telegram_enabled": target_enabled,
       "user_id": user.id
     }))
 }
@@ -2198,7 +2374,7 @@ async fn fetch_bound_user_by_chat_id(
     let row = sqlx::query(
         r#"
         SELECT id, email, username, class AS class_level, class_expire_time, expire_time,
-               transfer_total, transfer_enable, upload_today, download_today, status, token
+               transfer_total, transfer_enable, upload_today, download_today, status, token, telegram_enabled
         FROM users
         WHERE telegram_id = ?
         LIMIT 1
@@ -2261,6 +2437,10 @@ async fn fetch_bound_user_by_chat_id(
             .ok()
             .flatten()
             .unwrap_or_default(),
+        telegram_enabled: row
+            .try_get::<Option<i64>, _>("telegram_enabled")
+            .unwrap_or(Some(0))
+            .unwrap_or(0),
     }))
 }
 
@@ -2414,6 +2594,19 @@ fn value_to_chat_id(value: &Value) -> Option<String> {
     None
 }
 
+fn value_to_message_id(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return (number > 0).then_some(number);
+    }
+    if let Some(number) = value.as_u64() {
+        return i64::try_from(number).ok().filter(|value| *value > 0);
+    }
+    if let Some(text) = value.as_str() {
+        return text.trim().parse::<i64>().ok().filter(|value| *value > 0);
+    }
+    None
+}
+
 fn is_valid_bind_code(code: &str) -> bool {
     let len = code.len();
     if !(TELEGRAM_BIND_CODE_MIN_LEN..=TELEGRAM_BIND_CODE_MAX_LEN).contains(&len) {
@@ -2447,6 +2640,87 @@ fn subscription_label(value: &str) -> &'static str {
     }
 }
 
+fn parse_notify_command_arg(raw: &str) -> Option<bool> {
+    let normalized = raw.trim().to_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "on" | "enable" | "enabled" | "1" | "true" | "开" | "开启"
+    ) {
+        return Some(true);
+    }
+    if matches!(
+        normalized.as_str(),
+        "off" | "disable" | "disabled" | "0" | "false" | "关" | "关闭"
+    ) {
+        return Some(false);
+    }
+    None
+}
+
+fn build_notify_toggle_keyboard(enabled: bool) -> Value {
+    json!({
+      "inline_keyboard": [
+        [
+          {
+            "text": format!("{}开启通知", if enabled { "✅ " } else { "" }),
+            "callback_data": format!("{}on", NOTIFY_CALLBACK_PREFIX)
+          },
+          {
+            "text": format!("{}关闭通知", if !enabled { "✅ " } else { "" }),
+            "callback_data": format!("{}off", NOTIFY_CALLBACK_PREFIX)
+          }
+        ]
+      ]
+    })
+}
+
+async fn send_notify_status_message(
+    config: &TelegramBotConfig,
+    chat_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    send_telegram_message(
+        config,
+        chat_id,
+        &[
+            format!(
+                "当前 Telegram 通知：{}。",
+                if enabled { "已开启" } else { "已关闭" }
+            ),
+            if enabled {
+                "你将通过当前 Bot 接收公告和每日流量推送。".to_string()
+            } else {
+                "你将不会收到公告和每日流量推送。".to_string()
+            },
+            "可直接点击下方按钮切换。".to_string(),
+        ]
+        .join("\n"),
+        Some(build_notify_toggle_keyboard(enabled)),
+    )
+    .await
+}
+
+async fn update_telegram_notify_setting(
+    state: &AppState,
+    user_id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET telegram_enabled = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        "#,
+    )
+    .bind(if enabled { 1 } else { 0 })
+    .bind(user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 fn build_sublink_keyboard() -> Value {
     json!({
       "inline_keyboard": [
@@ -2473,6 +2747,7 @@ fn build_help_text() -> String {
         "/info - 查看账号信息和流量信息",
         "/link - 返回订阅链接按钮",
         "/panel - 在 Telegram 内打开面板",
+        "/notify - 开启或关闭 Telegram 通知",
         "/help - 显示帮助",
         "",
         "首次绑定：",
@@ -2610,6 +2885,43 @@ async fn answer_callback_query(
     if !response.status().is_success() {
         return Err(format!(
             "answerCallbackQuery 失败，状态码: {}",
+            response.status().as_u16()
+        ));
+    }
+
+    Ok(())
+}
+
+async fn delete_telegram_message(
+    config: &TelegramBotConfig,
+    chat_id: &str,
+    message_id: i64,
+) -> Result<(), String> {
+    if config.token.trim().is_empty() || chat_id.trim().is_empty() || message_id <= 0 {
+        return Ok(());
+    }
+
+    let endpoint = format!(
+        "{}/bot{}/deleteMessage",
+        config.api_base.trim_end_matches('/'),
+        config.token
+    );
+    let payload = json!({
+      "chat_id": chat_id,
+      "message_id": message_id
+    });
+
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .header("User-Agent", "Soga-Panel-Server/1.0")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "deleteMessage 失败，状态码: {}",
             response.status().as_u16()
         ));
     }

@@ -17,6 +17,7 @@ type DbRow = Record<string, unknown>;
 
 type TelegramMessage = {
   text?: string;
+  message_id?: string | number | bigint;
   chat?: {
     id?: string | number | bigint;
   };
@@ -61,6 +62,7 @@ type BoundTelegramUser = {
   download_today: number;
   status: number;
   token: string;
+  telegram_enabled: number;
 };
 
 type TelegramCommand = {
@@ -93,6 +95,7 @@ const REGISTER_EMAIL_REGEX =
   /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
 const REGISTER_USERNAME_REGEX = /^[A-Za-z0-9_]{3,20}$/;
 const LINK_CALLBACK_PREFIX = "link:";
+const NOTIFY_CALLBACK_PREFIX = "notify:";
 const REGISTER_CAPTCHA_TTL_SECONDS = 10 * 60;
 const REGISTER_SESSION_TTL_SECONDS = 30 * 60;
 const REGISTER_COMMAND_COOLDOWN_SECONDS = 30;
@@ -241,6 +244,9 @@ export class TelegramAPI {
       if (command.name === "panel") {
         return await this.handlePanelCommand(chatId, botConfig, request);
       }
+      if (command.name === "notify") {
+        return await this.handleNotifyCommand(chatId, command.arg, botConfig);
+      }
       if (command.name === "help") {
         return await this.handleHelpCommand(chatId, botConfig);
       }
@@ -258,6 +264,26 @@ export class TelegramAPI {
     botConfig: TelegramBotConfig
   ) {
     if (!startPayload) {
+      const boundUser = await this.getBoundUserByChatId(chatId);
+      if (boundUser) {
+        const accountName =
+          ensureString(boundUser.username, "").trim() || `#${boundUser.id}`;
+        await this.sendMessageIfEnabled(
+          botConfig,
+          chatId,
+          [
+            `当前 Telegram 已绑定账号：${accountName}。`,
+            "可发送 /info 查看账号信息，/panel 打开面板，/notify 管理通知。",
+            "更多命令请发送 /help。",
+          ].join("\n")
+        );
+        return successResponse({
+          ok: true,
+          skipped: "missing_bind_code_already_bound",
+          user_id: boundUser.id,
+        });
+      }
+
         await this.sendMessageIfEnabled(
           botConfig,
           chatId,
@@ -1198,6 +1224,62 @@ export class TelegramAPI {
     return successResponse({ ok: true, command: "help" });
   }
 
+  private async handleNotifyCommand(
+    chatId: string,
+    argText: string,
+    botConfig: TelegramBotConfig
+  ) {
+    const user = await this.getBoundUserByChatId(chatId);
+    if (!user) {
+      await this.sendMessageIfEnabled(
+        botConfig,
+        chatId,
+        "当前 Telegram 未绑定账号，请先在面板点击绑定并发送 /start 绑定码。"
+      );
+      return successResponse({ ok: true, skipped: "not_bound" });
+    }
+
+    const arg = argText.trim();
+    const currentEnabled = user.telegram_enabled === 1;
+    if (!arg) {
+      await this.sendNotifyStatusMessage(chatId, currentEnabled, botConfig);
+      return successResponse({
+        ok: true,
+        command: "notify_status",
+        telegram_enabled: currentEnabled,
+      });
+    }
+
+    const targetEnabled = this.parseNotifyCommandArg(arg);
+    if (targetEnabled === null) {
+      await this.sendMessageIfEnabled(
+        botConfig,
+        chatId,
+        "参数无效。请发送 /notify on 开启通知，或发送 /notify off 关闭通知。"
+      );
+      return successResponse({ ok: true, skipped: "notify_invalid_arg" });
+    }
+
+    if (targetEnabled === currentEnabled) {
+      await this.sendNotifyStatusMessage(chatId, currentEnabled, botConfig);
+      return successResponse({
+        ok: true,
+        command: "notify_no_change",
+        telegram_enabled: currentEnabled,
+      });
+    }
+
+    await this.updateTelegramNotifySetting(user.id, targetEnabled);
+    await this.sendNotifyStatusMessage(chatId, targetEnabled, botConfig);
+
+    return successResponse({
+      ok: true,
+      command: "notify_updated",
+      telegram_enabled: targetEnabled,
+      user_id: user.id,
+    });
+  }
+
   private async handleCallbackQuery(
     callbackQuery: TelegramCallbackQuery,
     botConfig: TelegramBotConfig,
@@ -1206,6 +1288,9 @@ export class TelegramAPI {
     const callbackId = ensureString(callbackQuery.id, "").trim();
     const data = ensureString(callbackQuery.data, "").trim();
     const chatId = this.normalizeChatId(callbackQuery.message?.chat?.id);
+    const callbackMessageId = this.normalizeTelegramMessageId(
+      callbackQuery.message?.message_id
+    );
 
     if (!chatId) {
       if (callbackId) {
@@ -1216,6 +1301,15 @@ export class TelegramAPI {
 
     if (data.startsWith(REGISTER_CAPTCHA_CALLBACK_PREFIX)) {
       return this.handleRegisterCaptchaCallback(chatId, data, callbackId, botConfig);
+    }
+    if (data.startsWith(NOTIFY_CALLBACK_PREFIX)) {
+      return this.handleNotifyCallback(
+        chatId,
+        data,
+        callbackId,
+        callbackMessageId,
+        botConfig
+      );
     }
 
     if (!data.startsWith(LINK_CALLBACK_PREFIX)) {
@@ -1272,6 +1366,59 @@ export class TelegramAPI {
       ok: true,
       command: "link_callback",
       type: target.type,
+      user_id: user.id,
+    });
+  }
+
+  private async handleNotifyCallback(
+    chatId: string,
+    callbackData: string,
+    callbackId: string,
+    callbackMessageId: number | null,
+    botConfig: TelegramBotConfig
+  ) {
+    const raw = callbackData.slice(NOTIFY_CALLBACK_PREFIX.length).trim();
+    const targetEnabled = this.parseNotifyCommandArg(raw);
+    if (targetEnabled === null) {
+      if (callbackId) {
+        await this.answerCallbackQuery(botConfig, callbackId, "按钮参数无效");
+      }
+      return successResponse({ ok: true, skipped: "notify_invalid_callback_arg" });
+    }
+
+    const user = await this.getBoundUserByChatId(chatId);
+    if (!user) {
+      await this.sendMessageIfEnabled(
+        botConfig,
+        chatId,
+        "当前 Telegram 未绑定账号，请先在面板点击绑定并发送 /start 绑定码。"
+      );
+      if (callbackId) {
+        await this.answerCallbackQuery(botConfig, callbackId, "当前未绑定账号");
+      }
+      return successResponse({ ok: true, skipped: "not_bound" });
+    }
+
+    const currentEnabled = user.telegram_enabled === 1;
+    if (targetEnabled !== currentEnabled) {
+      await this.updateTelegramNotifySetting(user.id, targetEnabled);
+    }
+    if (callbackMessageId && callbackMessageId > 0) {
+      await this.deleteMessageIfEnabled(botConfig, chatId, callbackMessageId);
+    }
+    await this.sendNotifyStatusMessage(chatId, targetEnabled, botConfig);
+
+    if (callbackId) {
+      await this.answerCallbackQuery(
+        botConfig,
+        callbackId,
+        targetEnabled ? "已开启通知" : "已关闭通知"
+      );
+    }
+    return successResponse({
+      ok: true,
+      command: "notify_callback",
+      telegram_enabled: targetEnabled,
       user_id: user.id,
     });
   }
@@ -1378,7 +1525,7 @@ export class TelegramAPI {
       .prepare(
         `
         SELECT id, email, username, class AS class_level, class_expire_time, expire_time,
-               transfer_total, transfer_enable, upload_today, download_today, status, token
+               transfer_total, transfer_enable, upload_today, download_today, status, token, telegram_enabled
         FROM users
         WHERE telegram_id = ?
         LIMIT 1
@@ -1401,7 +1548,51 @@ export class TelegramAPI {
       download_today: ensureNumber(user.download_today, 0),
       status: ensureNumber(user.status, 0),
       token: ensureString(user.token, ""),
+      telegram_enabled: ensureNumber(user.telegram_enabled, 0),
     };
+  }
+
+  private parseNotifyCommandArg(raw: string): boolean | null {
+    const normalized = raw.trim().toLowerCase();
+    if (
+      normalized === "on" ||
+      normalized === "enable" ||
+      normalized === "enabled" ||
+      normalized === "1" ||
+      normalized === "true" ||
+      normalized === "开" ||
+      normalized === "开启"
+    ) {
+      return true;
+    }
+    if (
+      normalized === "off" ||
+      normalized === "disable" ||
+      normalized === "disabled" ||
+      normalized === "0" ||
+      normalized === "false" ||
+      normalized === "关" ||
+      normalized === "关闭"
+    ) {
+      return false;
+    }
+    return null;
+  }
+
+  private normalizeTelegramMessageId(raw: unknown): number | null {
+    if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+      return Math.trunc(raw);
+    }
+    if (typeof raw === "string") {
+      const parsed = Number.parseInt(raw.trim(), 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+    if (typeof raw === "bigint" && raw > 0n && raw <= BigInt(Number.MAX_SAFE_INTEGER)) {
+      return Number(raw);
+    }
+    return null;
   }
 
   private buildSubscriptionKeyboard() {
@@ -1451,6 +1642,56 @@ export class TelegramAPI {
     ];
   }
 
+  private buildNotifyToggleKeyboard(enabled: boolean) {
+    return [
+      [
+        {
+          text: `${enabled ? "✅ " : ""}开启通知`,
+          callback_data: `${NOTIFY_CALLBACK_PREFIX}on`,
+        },
+        {
+          text: `${!enabled ? "✅ " : ""}关闭通知`,
+          callback_data: `${NOTIFY_CALLBACK_PREFIX}off`,
+        },
+      ],
+    ];
+  }
+
+  private async sendNotifyStatusMessage(
+    chatId: string,
+    enabled: boolean,
+    botConfig: TelegramBotConfig
+  ) {
+    await this.sendMessageIfEnabled(
+      botConfig,
+      chatId,
+      [
+        `当前 Telegram 通知：${enabled ? "已开启" : "已关闭"}。`,
+        enabled
+          ? "你将通过当前 Bot 接收公告和每日流量推送。"
+          : "你将不会收到公告和每日流量推送。",
+        "可直接点击下方按钮切换。",
+      ].join("\n"),
+      {
+        inline_keyboard: this.buildNotifyToggleKeyboard(enabled),
+      }
+    );
+  }
+
+  private async updateTelegramNotifySetting(userId: number, enabled: boolean) {
+    await this.db.db
+      .prepare(
+        `
+          UPDATE users
+          SET telegram_enabled = ?,
+              updated_at = datetime('now', '+8 hours')
+          WHERE id = ?
+        `
+      )
+      .bind(enabled ? 1 : 0, userId)
+      .run();
+  }
+
   private buildHelpText(): string {
     return [
       "可用命令：",
@@ -1458,6 +1699,7 @@ export class TelegramAPI {
       "/info - 查看账号信息和流量信息",
       "/link - 返回订阅链接按钮",
       "/panel - 在 Telegram 内打开面板",
+      "/notify - 开启或关闭 Telegram 通知",
       "/help - 显示帮助",
       "",
       "首次绑定：",
@@ -1603,6 +1845,40 @@ export class TelegramAPI {
       }
     } catch (error) {
       console.error("Telegram webhook reply error:", error);
+    }
+  }
+
+  private async deleteMessageIfEnabled(
+    botConfig: TelegramBotConfig,
+    chatId: string,
+    messageId: number
+  ) {
+    if (!botConfig.token || !chatId || !Number.isFinite(messageId) || messageId <= 0) {
+      return;
+    }
+
+    try {
+      const endpoint = `${botConfig.apiBase.replace(/\/+$/, "")}/bot${botConfig.token}/deleteMessage`;
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "User-Agent": "Soga-Panel/1.0",
+        },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+        }),
+      });
+      if (!response.ok) {
+        console.warn(
+          "Telegram deleteMessage failed:",
+          response.status,
+          await response.text().catch(() => "")
+        );
+      }
+    } catch (error) {
+      console.warn("Telegram deleteMessage error:", error);
     }
   }
 
