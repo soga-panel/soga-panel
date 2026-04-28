@@ -7,9 +7,11 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine;
 use chrono::{NaiveDateTime, Utc};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::Sha256;
 use sqlx::Row;
 use std::collections::HashSet;
 
@@ -43,12 +45,14 @@ const TRUST_TTL: u64 = 60 * 60 * 24 * 30;
 const TWO_FACTOR_TTL: u64 = 60 * 5;
 const OAUTH_PENDING_TTL: i64 = 600;
 const PASSKEY_CHALLENGE_TTL: i64 = 300;
+const TELEGRAM_INIT_DATA_MAX_AGE_SECONDS: i64 = 86400;
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/register-config", get(get_register_config))
         .route("/register", post(post_register))
         .route("/login", post(post_login))
+        .route("/telegram-miniapp", post(post_telegram_miniapp_login))
         .route("/verify-2fa", post(post_verify_2fa))
         .route("/logout", post(post_logout))
         .route("/send-email-code", post(post_send_email_code))
@@ -83,6 +87,15 @@ struct LoginRequest {
     turnstile_token: Option<String>,
     #[serde(rename = "cf-turnstile-response")]
     cf_turnstile_response: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TelegramMiniAppLoginRequest {
+    #[serde(alias = "initData", alias = "init_data")]
+    init_data: Option<String>,
+    remember: Option<bool>,
+    #[serde(alias = "twoFactorTrustToken")]
+    two_factor_trust_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1591,6 +1604,86 @@ async fn post_login(
     finalize_login(&state, &user, "password", &headers).await
 }
 
+async fn post_telegram_miniapp_login(
+    State(state): State<AppState>,
+    Extension(headers): Extension<axum::http::HeaderMap>,
+    Json(body): Json<TelegramMiniAppLoginRequest>,
+) -> Response {
+    let init_data = body.init_data.unwrap_or_default().trim().to_string();
+    if init_data.is_empty() {
+        return error(StatusCode::BAD_REQUEST, "缺少 Telegram initData", None);
+    }
+
+    let configs = list_system_configs(&state).await.unwrap_or_default();
+    let mut bot_token = configs
+        .get("telegram_bot_token")
+        .cloned()
+        .unwrap_or_default();
+    if bot_token.trim().is_empty() {
+        bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+    }
+    if bot_token.trim().is_empty() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "未配置 telegram_bot_token，请联系管理员",
+            None,
+        );
+    }
+
+    let telegram_user_id = match verify_telegram_init_data(&init_data, &bot_token) {
+        Ok(value) => value,
+        Err(message) => return error(StatusCode::UNAUTHORIZED, &message, None),
+    };
+    let telegram_id = telegram_user_id.to_string();
+
+    let user = match get_user_by_telegram_id(&state, &telegram_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "当前 Telegram 未绑定账号，请先在面板完成绑定",
+                None,
+            )
+        }
+        Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, &message, None),
+    };
+
+    if user.status != 1 {
+        return error(StatusCode::UNAUTHORIZED, "账户已禁用", None);
+    }
+
+    if user.two_factor_enabled == 1 {
+        let trust_token = body.two_factor_trust_token.unwrap_or_default();
+        if !trust_token.trim().is_empty() {
+            if let Some(value) =
+                cache_get_redis_only(&state, &format!("2fa_trust_{trust_token}")).await
+            {
+                if value == user.id.to_string() {
+                    return finalize_login(&state, &user, "telegram_miniapp", &headers).await;
+                }
+            }
+        }
+
+        let challenge_id =
+            create_two_factor_challenge(&state, user.id, body.remember.unwrap_or(true)).await;
+        return success(
+            json!({
+              "need_2fa": true,
+              "challenge_id": challenge_id,
+              "two_factor_enabled": true,
+              "provider": "telegram"
+            }),
+            "Success",
+        )
+        .into_response();
+    }
+
+    finalize_login(&state, &user, "telegram_miniapp", &headers).await
+}
+
 async fn post_verify_2fa(
     State(state): State<AppState>,
     Extension(headers): Extension<axum::http::HeaderMap>,
@@ -3091,6 +3184,115 @@ fn to_int_config(value: Option<&String>, fallback: i64, min: i64, allow_zero: bo
     parsed
 }
 
+fn verify_telegram_init_data(init_data: &str, bot_token: &str) -> Result<i64, String> {
+    let normalized = init_data
+        .trim()
+        .trim_start_matches('?')
+        .trim_start_matches('#');
+    if normalized.is_empty() {
+        return Err("缺少 Telegram initData".to_string());
+    }
+
+    let parsed: Vec<(String, String)> = serde_urlencoded::from_str(normalized)
+        .map_err(|_| "Telegram initData 格式无效".to_string())?;
+    if parsed.is_empty() {
+        return Err("Telegram initData 为空".to_string());
+    }
+
+    let mut hash = String::new();
+    let mut auth_date: i64 = 0;
+    let mut user_raw = String::new();
+    let mut receiver_raw = String::new();
+    let mut data_check_parts: Vec<String> = Vec::new();
+    for (key, value) in parsed {
+        if key == "hash" {
+            hash = value.to_lowercase();
+            continue;
+        }
+        if key == "auth_date" {
+            auth_date = value.parse::<i64>().unwrap_or(0);
+        }
+        if key == "user" {
+            user_raw = value.clone();
+        }
+        if key == "receiver" {
+            receiver_raw = value.clone();
+        }
+        data_check_parts.push(format!("{key}={value}"));
+    }
+
+    if hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("Telegram hash 参数无效".to_string());
+    }
+    if auth_date <= 0 {
+        return Err("Telegram auth_date 参数无效".to_string());
+    }
+    let now = Utc::now().timestamp();
+    if (now - auth_date).abs() > TELEGRAM_INIT_DATA_MAX_AGE_SECONDS {
+        return Err("Telegram 授权数据已过期，请重新打开 Mini App".to_string());
+    }
+    let user_payload = if user_raw.trim().is_empty() {
+        receiver_raw
+    } else {
+        user_raw
+    };
+    if user_payload.trim().is_empty() {
+        return Err("Telegram user 参数无效".to_string());
+    }
+
+    data_check_parts.sort();
+    let data_check_string = data_check_parts.join("\n");
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut secret_mac = <HmacSha256 as Mac>::new_from_slice(b"WebAppData")
+        .map_err(|_| "Telegram 签名校验失败".to_string())?;
+    secret_mac.update(bot_token.as_bytes());
+    let secret_key = secret_mac.finalize().into_bytes();
+
+    let mut check_mac = <HmacSha256 as Mac>::new_from_slice(secret_key.as_slice())
+        .map_err(|_| "Telegram 签名校验失败".to_string())?;
+    check_mac.update(data_check_string.as_bytes());
+    let expected_hash = hex::encode(check_mac.finalize().into_bytes());
+    if !timing_safe_eq(&hash, &expected_hash) {
+        return Err("Telegram 签名校验失败".to_string());
+    }
+
+    let user_json: Value =
+        serde_json::from_str(&user_payload).map_err(|_| "Telegram user 参数无效".to_string())?;
+    let user_id = user_json
+        .get("id")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            user_json
+                .get("id")
+                .and_then(Value::as_u64)
+                .and_then(|value| i64::try_from(value).ok())
+        })
+        .or_else(|| {
+            user_json
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|value| value.trim().parse::<i64>().ok())
+        })
+        .unwrap_or(0);
+    if user_id <= 0 {
+        return Err("Telegram user 参数无效".to_string());
+    }
+
+    Ok(user_id)
+}
+
+fn timing_safe_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (a, b) in left.bytes().zip(right.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 fn is_valid_email(email: &str) -> bool {
     if email.contains(' ') {
         return false;
@@ -3270,6 +3472,26 @@ async fn get_user_by_email(state: &AppState, email: &str) -> Result<Option<UserR
     "#,
     )
     .bind(email)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(row.map(|r| UserRow::from_row(&r)))
+}
+
+async fn get_user_by_telegram_id(
+    state: &AppState,
+    telegram_id: &str,
+) -> Result<Option<UserRow>, String> {
+    let row = sqlx::query(
+        r#"
+    SELECT id, email, username, is_admin, status, password_hash,
+           two_factor_enabled, two_factor_secret, two_factor_backup_codes,
+           google_sub, github_id
+    FROM users WHERE telegram_id = ?
+    LIMIT 1
+    "#,
+    )
+    .bind(telegram_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|err| err.to_string())?;
