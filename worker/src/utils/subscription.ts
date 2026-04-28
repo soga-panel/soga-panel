@@ -1343,13 +1343,15 @@ export function generateSurgeConfig(nodes, user) {
 
   for (const node of nodes) {
     const { config, server, port, tlsHost, client } = resolveNodeEndpoint(node);
-    if (node.type === "vless" && isVlessEncryptionEnabled(config, client)) {
+    const nodeType = ensureString(node.type, "").toLowerCase();
+    if (nodeType === "vless" && isVlessEncryptionEnabled(config, client)) {
       continue;
     }
     let proxy = "";
 
-    switch (node.type) {
+    switch (nodeType) {
       case "v2ray":
+      case "vless":
         proxy = `${node.name} = vmess, ${server}, ${port}, username=${user.uuid}`;
         if (config.tls_type === "tls" || config.tls_type === "reality") {
           proxy += ", tls=true";
