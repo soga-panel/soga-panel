@@ -268,6 +268,7 @@ import {
 import { GoogleLogin } from "vue3-google-login";
 import {
   login,
+  loginWithTelegramMiniApp,
   loginWithGoogle,
   loginWithGithub,
   getRegisterConfig,
@@ -534,6 +535,43 @@ const handleGoogleClick = () => {
 const githubStateStorageKey = "github_oauth_state";
 const githubRememberStorageKey = "github_oauth_remember";
 const trustTokenStorageKey = "soga_tf_trust_token";
+const telegramScriptId = "telegram-web-app-sdk";
+const telegramAutoLoginLoading = ref(false);
+const safeGetSessionStorageItem = (key: string): string | null => {
+  try {
+    return sessionStorage.getItem(key);
+  } catch (error) {
+    console.warn(`读取 sessionStorage 失败: ${key}`, error);
+    return null;
+  }
+};
+const safeSetSessionStorageItem = (key: string, value: string): boolean => {
+  try {
+    sessionStorage.setItem(key, value);
+    return true;
+  } catch (error) {
+    console.warn(`写入 sessionStorage 失败: ${key}`, error);
+    return false;
+  }
+};
+const safeRemoveSessionStorageItem = (key: string): void => {
+  try {
+    sessionStorage.removeItem(key);
+  } catch (error) {
+    console.warn(`移除 sessionStorage 失败: ${key}`, error);
+  }
+};
+const clearGithubOAuthSessionState = () => {
+  safeRemoveSessionStorageItem(githubStateStorageKey);
+  safeRemoveSessionStorageItem(githubRememberStorageKey);
+};
+const shouldAttemptTelegramMiniAppLogin = computed(() => {
+  const raw = route.query.tgMiniApp;
+  if (Array.isArray(raw)) {
+    return raw.some((item) => String(item).trim() === "1");
+  }
+  return String(raw ?? "").trim() === "1";
+});
 
 const twoFactorDialogVisible = ref(false);
 const twoFactorSubmitting = ref(false);
@@ -563,8 +601,12 @@ const handleGithubClick = () => {
 
 const startGithubOAuth = () => {
   const state = createOAuthState(12);
-  sessionStorage.setItem(githubStateStorageKey, state);
-  sessionStorage.setItem(
+  const stateStored = safeSetSessionStorageItem(githubStateStorageKey, state);
+  if (!stateStored) {
+    ElMessage.error("当前环境限制会话存储，暂时无法使用 GitHub 登录");
+    return;
+  }
+  safeSetSessionStorageItem(
     githubRememberStorageKey,
     rememberLogin.value ? "1" : "0"
   );
@@ -787,17 +829,16 @@ const processGithubCallback = async () => {
   const returnedState = typeof route.query.state === "string" ? route.query.state : "";
   const error = typeof route.query.error === "string" ? route.query.error : "";
 
-  const expectedState = sessionStorage.getItem(githubStateStorageKey);
+  const expectedState = safeGetSessionStorageItem(githubStateStorageKey);
   const rememberFlag =
-    sessionStorage.getItem(githubRememberStorageKey) === "1";
+    safeGetSessionStorageItem(githubRememberStorageKey) === "1";
   rememberLogin.value = rememberFlag;
 
   if (provider !== "github" && !expectedState) return;
 
   if (!githubLoginEnabled.value) {
     ElMessage.warning("暂未配置 GitHub 登录，请联系管理员");
-    sessionStorage.removeItem(githubStateStorageKey);
-    sessionStorage.removeItem(githubRememberStorageKey);
+    clearGithubOAuthSessionState();
     return;
   }
 
@@ -810,19 +851,16 @@ const processGithubCallback = async () => {
 
   if (error) {
     ElMessage.error("GitHub 授权被取消或失败");
-    sessionStorage.removeItem(githubStateStorageKey);
-    sessionStorage.removeItem(githubRememberStorageKey);
+    clearGithubOAuthSessionState();
     return;
   }
 
   if (!code) {
-    sessionStorage.removeItem(githubStateStorageKey);
-    sessionStorage.removeItem(githubRememberStorageKey);
+    clearGithubOAuthSessionState();
     return;
   }
 
-  sessionStorage.removeItem(githubStateStorageKey);
-  sessionStorage.removeItem(githubRememberStorageKey);
+  clearGithubOAuthSessionState();
 
   if (expectedState && returnedState && expectedState !== returnedState) {
     ElMessage.error("GitHub 登录状态校验失败，请重试");
@@ -838,6 +876,83 @@ const processGithubCallback = async () => {
   await performGithubLogin(githubPayload);
 };
 
+const loadTelegramWebAppSdk = async () => {
+  if (typeof window === "undefined") return;
+  if ((window as any).Telegram?.WebApp) return;
+
+  await new Promise<void>((resolve, reject) => {
+    const existing = document.getElementById(
+      telegramScriptId
+    ) as HTMLScriptElement | null;
+    if (existing) {
+      existing.addEventListener("load", () => resolve(), { once: true });
+      existing.addEventListener(
+        "error",
+        () => reject(new Error("Telegram SDK 加载失败")),
+        { once: true }
+      );
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.id = telegramScriptId;
+    script.src = "https://telegram.org/js/telegram-web-app.js";
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Telegram SDK 加载失败"));
+    document.head.appendChild(script);
+  });
+};
+
+const getTelegramMiniAppInitData = () => {
+  const webApp = (window as any).Telegram?.WebApp;
+  if (!webApp) return "";
+  try {
+    webApp.ready?.();
+    webApp.expand?.();
+  } catch (error) {
+    console.warn("Telegram WebApp ready/expand 调用失败", error);
+  }
+  return (webApp.initData || "").toString().trim();
+};
+
+const tryTelegramMiniAppLogin = async () => {
+  if (!shouldAttemptTelegramMiniAppLogin.value) return;
+  if (telegramAutoLoginLoading.value) return;
+  telegramAutoLoginLoading.value = true;
+
+  try {
+    await loadTelegramWebAppSdk();
+    const initData = getTelegramMiniAppInitData();
+    if (!initData) {
+      ElMessage.warning("未获取到 Telegram Mini App 授权数据，请从机器人重新打开面板");
+      return;
+    }
+
+    const storedTrustToken = localStorage.getItem(trustTokenStorageKey) || "";
+    const { data } = await loginWithTelegramMiniApp({
+      initData,
+      remember: true,
+      twoFactorTrustToken: storedTrustToken || undefined,
+    });
+
+    if (requiresTwoFactor(data)) {
+      localStorage.removeItem(trustTokenStorageKey);
+      openTwoFactorDialog(data, "Telegram");
+      return;
+    }
+
+    completeLogin(data, "Telegram");
+    navigateAfterLogin(data, "Telegram");
+  } catch (error) {
+    console.error("Telegram Mini App 登录失败:", error);
+    ElMessage.error((error as any)?.message || "Telegram Mini App 登录失败，请稍后重试");
+  } finally {
+    telegramAutoLoginLoading.value = false;
+  }
+};
+
 const loadAuthConfig = async () => {
   try {
     const { data } = await getRegisterConfig();
@@ -850,8 +965,15 @@ const loadAuthConfig = async () => {
 };
 
 onMounted(() => {
-  loadAuthConfig();
-  processGithubCallback();
+  void loadAuthConfig().catch((error) => {
+    console.warn("初始化认证配置失败:", error);
+  });
+  void processGithubCallback().catch((error) => {
+    console.warn("处理 GitHub OAuth 回调失败:", error);
+  });
+  void tryTelegramMiniAppLogin().catch((error) => {
+    console.warn("执行 Telegram Mini App 自动登录失败:", error);
+  });
   if (turnstileEnabled.value && typeof window !== "undefined") {
     const scriptId = "cf-turnstile-script";
     const existingScript = document.getElementById(scriptId);

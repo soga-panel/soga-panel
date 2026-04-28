@@ -115,6 +115,52 @@ curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
   }'
 ```
 
+## Telegram Mini App（在 Bot 内打开面板）
+
+1. 在系统配置中设置 `telegram_miniapp_url`（可选，不填则默认使用 `site_url`）。
+2. Bot 已支持 `/panel` 命令，会返回一个 `web_app` 按钮，点击后在 Telegram 内打开面板。
+3. 推荐将菜单按钮指向 Mini App 登录页：
+
+```bash
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setChatMenuButton" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "menu_button": {
+      "type": "web_app",
+      "text": "打开面板",
+      "web_app": { "url": "https://你的面板域名/auth/login?tgMiniApp=1" }
+    }
+  }'
+```
+
+4. 可选：设置机器人命令列表（包含 `/panel`）：
+
+```bash
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setMyCommands" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "commands": [
+      {"command":"help","description":"查看帮助"},
+      {"command":"register","description":"注册新账号"},
+      {"command":"code","description":"提交邮箱验证码"},
+      {"command":"info","description":"查看账号信息"},
+      {"command":"link","description":"获取订阅链接"},
+      {"command":"panel","description":"在 Telegram 内打开面板"}
+    ]
+  }'
+```
+
+5. Telegram 内注册流程（未绑定账号时）：
+
+```text
+/register
+  -> Bot 返回人机验证码
+  -> 用户点击 4 选 1 验证码按钮（1 个正确，3 个错误）
+  -> 验证通过后依次发送：邮箱、用户名、邀请码（可发送 skip / 无 跳过）
+  -> 邮箱收到 6 位验证码后，直接发送 6 位数字验证码
+  -> 注册成功后 Bot 返回初始账号信息，并自动绑定当前 Telegram
+```
+
 ## 安全建议
 
 - 使用强密码或随机字符串作为 `JWT_SECRET`、`WEBAPI_KEY`
@@ -122,4 +168,4 @@ curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
 - 监控 Worker 日志与 Cloudflare 网络分析，及时发现异常流量
 - 在管理后台登录后及时修改默认管理员密码
 
-更多接口详情见《backend-api.md》。***
+更多接口详情见《backend-api.md》。

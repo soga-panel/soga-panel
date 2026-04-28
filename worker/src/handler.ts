@@ -66,6 +66,7 @@ export async function handleRequest(
 
     // 用户认证 API
     "POST /api/auth/login": () => authAPI.login(request),
+    "POST /api/auth/telegram-miniapp": () => authAPI.telegramMiniAppLogin(request),
     "POST /api/auth/google": () => authAPI.googleOAuthLogin(request),
     "POST /api/auth/github": () => authAPI.githubOAuthLogin(request),
     "POST /api/auth/register": () => authAPI.register(request),

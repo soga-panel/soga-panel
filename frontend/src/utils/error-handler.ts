@@ -11,6 +11,81 @@ class ErrorHandler {
   private errorLog: ErrorInfo[] = [];
   private maxLogSize = 100;
 
+  private normalizeUnknownErrorMessage(reason: unknown): string {
+    if (reason instanceof Error) {
+      return reason.message || reason.name || "未知错误";
+    }
+    if (typeof reason === "string") {
+      return reason;
+    }
+    if (typeof reason === "number" || typeof reason === "boolean") {
+      return String(reason);
+    }
+    if (reason && typeof reason === "object") {
+      const maybeMessage = (reason as any).message;
+      if (typeof maybeMessage === "string" && maybeMessage.trim()) {
+        return maybeMessage;
+      }
+      const maybeName = (reason as any).name;
+      if (typeof maybeName === "string" && maybeName.trim()) {
+        return maybeName;
+      }
+      try {
+        return JSON.stringify(reason);
+      } catch {
+        return "未知错误对象";
+      }
+    }
+    return "未知错误";
+  }
+
+  private shouldIgnoreUnhandledRejection(reason: unknown): boolean {
+    const message = this.normalizeUnknownErrorMessage(reason).toLowerCase();
+    const knownIgnorePatterns = [
+      "cancel",
+      "canceled",
+      "cancelled",
+      "aborterror",
+      "aborted",
+      "navigation cancelled",
+      "navigation aborted",
+      "avoided redundant navigation",
+      "navigationduplicated",
+      "user denied",
+      "the user aborted a request",
+      "the operation was aborted"
+    ];
+
+    return knownIgnorePatterns.some((pattern) => message.includes(pattern));
+  }
+
+  private isAxiosLikeRejection(reason: unknown): boolean {
+    if (!reason || typeof reason !== "object") return false;
+    const anyReason = reason as any;
+    return (
+      anyReason.isAxiosError === true ||
+      anyReason.name === "AxiosError"
+    );
+  }
+
+  private shouldShowUnhandledRejectionToast(reason: unknown): boolean {
+    if (this.shouldIgnoreUnhandledRejection(reason)) {
+      return false;
+    }
+    if (this.isAxiosLikeRejection(reason)) {
+      // Axios 错误一般已经被业务层或拦截器提示过，避免重复弹窗
+      return false;
+    }
+    if (reason instanceof Error) {
+      return true;
+    }
+    if (typeof reason === "string") {
+      return reason.trim().length > 0;
+    }
+    // 非 Error/字符串（例如路由导航失败对象）通常是可预期拒绝
+    return false;
+  }
+
   // 处理API错误
   handleApiError(error: import('axios').AxiosError | Error, context?: string): void {
     const isAxiosError = 'response' in error && error.response;
@@ -111,12 +186,29 @@ class ErrorHandler {
 
   // 处理未处理的Promise拒绝
   handleUnhandledRejection(event: PromiseRejectionEvent): void {
+    if (!this.shouldShowUnhandledRejectionToast(event.reason)) {
+      event.preventDefault();
+      if (import.meta.env.DEV) {
+        console.warn("Ignored unhandled Promise rejection:", event.reason);
+      }
+      return;
+    }
+
+    const reasonText = this.normalizeUnknownErrorMessage(event.reason);
     const errorInfo: ErrorInfo = {
-      message: `未处理的Promise拒绝: ${event.reason}`,
+      message: `未处理的Promise拒绝: ${reasonText}`,
       timestamp: new Date()
     };
 
     this.logError(errorInfo);
+
+    // 阻止浏览器默认输出，避免重复噪音
+    event.preventDefault();
+
+    if (import.meta.env.DEV) {
+      console.error("Unhandled Promise rejection reason:", event.reason);
+    }
+
     ElMessage.error('系统出现未处理的异步错误');
   }
 

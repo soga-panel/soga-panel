@@ -20,6 +20,17 @@ export const login = (data: LoginRequest): Promise<ApiResponse<LoginResponse>> =
 };
 
 /**
+ * Telegram Mini App 登录
+ */
+export const loginWithTelegramMiniApp = (data: {
+  initData: string;
+  remember?: boolean;
+  twoFactorTrustToken?: string;
+}): Promise<ApiResponse<LoginResponse>> => {
+  return http.post("/auth/telegram-miniapp", data);
+};
+
+/**
  * Google OAuth 登录
  */
 export const loginWithGoogle = (

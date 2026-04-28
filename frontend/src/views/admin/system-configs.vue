@@ -81,6 +81,7 @@
             <li><strong>telegram_bot_api_base</strong>: Telegram API 基础地址（默认 https://api.telegram.org）</li>
             <li><strong>telegram_bot_username</strong>: 机器人用户名（不含 @，用于生成一键绑定链接）</li>
             <li><strong>telegram_webhook_secret</strong>: Webhook 请求头校验密钥（可选）</li>
+            <li><strong>telegram_miniapp_url</strong>: Telegram Mini App 打开地址（为空时自动使用 site_url）</li>
             <li><strong>rebate_rate</strong>: 邀请返利比例，0.1 表示 10%</li>
             <li><strong>rebate_mode</strong>: first_order=首单返利，every_order=每笔返利</li>
             <li><strong>invite_default_limit</strong>: 默认邀请码可使用次数（0 表示不限）</li>

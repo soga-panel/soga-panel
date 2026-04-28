@@ -472,6 +472,40 @@ CREATE INDEX IF NOT EXISTS idx_email_verification_email_purpose ON email_verific
 CREATE INDEX IF NOT EXISTS idx_email_verification_expires_at ON email_verification_codes (expires_at);
 CREATE INDEX IF NOT EXISTS idx_email_verification_used_at ON email_verification_codes (used_at);
 
+-- Telegram 注册会话表
+-- 字段说明：
+-- chat_id: Telegram Chat ID（主键）
+-- stage: 注册阶段（captcha_pending / email_code_pending）
+-- human_code_hash: 人机验证码哈希
+-- human_code_expires_at: 人机验证码过期时间（Unix 秒）
+-- human_code_attempts: 人机验证码错误次数
+-- email: 待注册邮箱
+-- username: 待注册用户名
+-- invite_code: 待使用邀请码（可空）
+-- email_code_attempts: 邮箱验证码尝试次数（用于会话层提示）
+-- session_expires_at: 会话过期时间（Unix 秒）
+-- created_at: 创建时间（UTC+8）
+-- updated_at: 更新时间（UTC+8）
+CREATE TABLE IF NOT EXISTS telegram_register_sessions (
+    chat_id TEXT PRIMARY KEY,
+    stage TEXT NOT NULL,
+    human_code_hash TEXT,
+    human_code_expires_at INTEGER,
+    human_code_attempts INTEGER NOT NULL DEFAULT 0,
+    email TEXT,
+    username TEXT,
+    invite_code TEXT,
+    email_code_attempts INTEGER NOT NULL DEFAULT 0,
+    session_expires_at INTEGER NOT NULL,
+    created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+    updated_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tg_register_session_expires
+ON telegram_register_sessions (session_expires_at);
+CREATE INDEX IF NOT EXISTS idx_tg_register_session_stage
+ON telegram_register_sessions (stage);
+
 -- 用户会话表（替代KV存储）
 -- 字段说明：
 -- id: 会话记录唯一标识ID（主键）

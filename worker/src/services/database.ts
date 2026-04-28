@@ -9,6 +9,8 @@ export class DatabaseService {
   private registerIpColumnExists = false;
   private telegramColumnsChecked = false;
   private telegramColumnsReady = false;
+  private telegramRegisterSessionChecked = false;
+  private telegramRegisterSessionReady = false;
   private xraySchemaChecked = false;
   private xraySchemaReady = false;
 
@@ -117,6 +119,77 @@ export class DatabaseService {
     }
 
     return this.telegramColumnsReady;
+  }
+
+  async ensureTelegramRegisterSessionTable() {
+    if (
+      this.telegramRegisterSessionChecked &&
+      this.telegramRegisterSessionReady
+    ) {
+      return true;
+    }
+
+    try {
+      await this.db
+        .prepare(
+          `
+          CREATE TABLE IF NOT EXISTS telegram_register_sessions (
+            chat_id TEXT PRIMARY KEY,
+            stage TEXT NOT NULL,
+            human_code_hash TEXT,
+            human_code_expires_at INTEGER,
+            human_code_attempts INTEGER NOT NULL DEFAULT 0,
+            email TEXT,
+            username TEXT,
+            invite_code TEXT,
+            email_code_attempts INTEGER NOT NULL DEFAULT 0,
+            session_expires_at INTEGER NOT NULL,
+            created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+            updated_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+          )
+        `
+        )
+        .run();
+
+      await this.db
+        .prepare(
+          `
+          CREATE INDEX IF NOT EXISTS idx_tg_register_session_expires
+          ON telegram_register_sessions (session_expires_at)
+        `
+        )
+        .run();
+
+      await this.db
+        .prepare(
+          `
+          CREATE INDEX IF NOT EXISTS idx_tg_register_session_stage
+          ON telegram_register_sessions (stage)
+        `
+        )
+        .run();
+
+      this.telegramRegisterSessionReady = true;
+      this.telegramRegisterSessionChecked = true;
+    } catch (error) {
+      console.error("ensureTelegramRegisterSessionTable error:", error);
+      this.telegramRegisterSessionReady = false;
+    }
+
+    return this.telegramRegisterSessionReady;
+  }
+
+  async cleanupExpiredTelegramRegisterSessions(nowUnix = Math.floor(Date.now() / 1000)) {
+    await this.ensureTelegramRegisterSessionTable();
+    await this.db
+      .prepare(
+        `
+        DELETE FROM telegram_register_sessions
+        WHERE session_expires_at <= ?
+      `
+      )
+      .bind(nowUnix)
+      .run();
   }
 
   private normalizeIdList(value: unknown): number[] {

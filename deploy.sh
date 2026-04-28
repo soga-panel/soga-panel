@@ -54,13 +54,9 @@ cd frontend
 print_info "安装前端依赖..."
 pnpm install
 
-# 构建前端
-print_info "构建前端代码..."
-pnpm build
-
 # 部署前端到 Cloudflare Pages
 print_info "部署前端到 Cloudflare Pages..."
-wrangler pages deploy dist --project-name=soga-panel-frontend --branch=main
+pnpm run deploy
 
 print_success "前端部署完成"
 
@@ -73,7 +69,7 @@ cd worker
 
 # 部署后端到 Cloudflare Workers
 print_info "部署后端到 Cloudflare Workers..."
-wrangler deploy --minify --var BUILD_TIME:"$(date +"%Y/%m/%d %H:%M:%S")"
+pnpm run deploy
 
 print_success "后端部署完成"
 

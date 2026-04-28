@@ -114,6 +114,13 @@ type PendingOAuthRegistration = {
   userAgent: string;
 };
 
+type TelegramMiniAppUser = {
+  id: number;
+  username?: string;
+  first_name?: string;
+  last_name?: string;
+};
+
 const EMAIL_REGEX =
   /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
 
@@ -123,6 +130,7 @@ const PURPOSE_PASSWORD_RESET = "password_reset";
 const TWO_FACTOR_CHALLENGE_TTL = 300;
 const TRUSTED_DEVICE_TTL_DAYS = 30;
 const PASSKEY_CHALLENGE_TTL = 300;
+const TELEGRAM_INIT_DATA_MAX_AGE_SECONDS = 86400;
 
 interface AuthUserRow {
   id: number;
@@ -214,6 +222,134 @@ export class AuthAPI {
       }
     }
     return defaultValue;
+  }
+
+  private bytesToHex(bytes: Uint8Array) {
+    return Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  private timingSafeEqual(a: string, b: string) {
+    if (a.length !== b.length) {
+      return false;
+    }
+    let diff = 0;
+    for (let i = 0; i < a.length; i += 1) {
+      diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+    return diff === 0;
+  }
+
+  private async hmacSha256(
+    key: string | Uint8Array,
+    data: string
+  ): Promise<Uint8Array> {
+    const encoder = new TextEncoder();
+    const keyData = typeof key === "string" ? encoder.encode(key) : key;
+    const normalizedKey = new Uint8Array(keyData.byteLength);
+    normalizedKey.set(keyData);
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      normalizedKey,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    const signature = await crypto.subtle.sign(
+      "HMAC",
+      cryptoKey,
+      encoder.encode(data)
+    );
+    return new Uint8Array(signature);
+  }
+
+  private parseTelegramMiniAppUser(rawUser: string): TelegramMiniAppUser | null {
+    if (!rawUser) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(rawUser) as Record<string, unknown>;
+      const idRaw = parsed?.id;
+      const id =
+        typeof idRaw === "number"
+          ? Math.trunc(idRaw)
+          : Number.parseInt(String(idRaw ?? ""), 10);
+      if (!Number.isSafeInteger(id) || id <= 0) {
+        return null;
+      }
+
+      const user: TelegramMiniAppUser = { id };
+      if (typeof parsed.username === "string") {
+        user.username = parsed.username;
+      }
+      if (typeof parsed.first_name === "string") {
+        user.first_name = parsed.first_name;
+      }
+      if (typeof parsed.last_name === "string") {
+        user.last_name = parsed.last_name;
+      }
+      return user;
+    } catch {
+      return null;
+    }
+  }
+
+  private async verifyTelegramInitData(rawInitData: string, botToken: string) {
+    const initData = rawInitData.trim().replace(/^[?#]/, "");
+    if (!initData) {
+      return { ok: false, reason: "缺少 Telegram initData" };
+    }
+
+    const params = new URLSearchParams(initData);
+    const hash = ensureString(params.get("hash"), "").trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(hash)) {
+      return { ok: false, reason: "Telegram hash 参数无效" };
+    }
+
+    const authDate = Number.parseInt(
+      ensureString(params.get("auth_date"), "").trim(),
+      10
+    );
+    if (!Number.isFinite(authDate) || authDate <= 0) {
+      return { ok: false, reason: "Telegram auth_date 参数无效" };
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - authDate) > TELEGRAM_INIT_DATA_MAX_AGE_SECONDS) {
+      return { ok: false, reason: "Telegram 授权数据已过期，请重新打开 Mini App" };
+    }
+
+    const telegramUser = this.parseTelegramMiniAppUser(
+      ensureString(params.get("user"), "")
+    );
+    if (!telegramUser) {
+      return { ok: false, reason: "Telegram user 参数无效" };
+    }
+
+    const dataCheckItems: string[] = [];
+    for (const [key, value] of params.entries()) {
+      if (key === "hash") continue;
+      dataCheckItems.push(`${key}=${value}`);
+    }
+    dataCheckItems.sort((a, b) => a.localeCompare(b));
+    const dataCheckString = dataCheckItems.join("\n");
+
+    const secretKey = await this.hmacSha256("WebAppData", botToken);
+    const expectedHash = this.bytesToHex(
+      await this.hmacSha256(secretKey, dataCheckString)
+    );
+
+    if (!this.timingSafeEqual(hash, expectedHash)) {
+      return { ok: false, reason: "Telegram 签名校验失败" };
+    }
+
+    return {
+      ok: true,
+      user: telegramUser,
+      authDate,
+    };
   }
 
   private getExpectedOrigin(request: Request) {
@@ -1822,6 +1958,123 @@ export class AuthAPI {
       console.error("Login error:", error);
       return errorResponse(error.message, 500);
     }
+  }
+
+  async telegramMiniAppLogin(request) {
+    let body: any;
+    try {
+      body = await request.json();
+    } catch (error) {
+      this.logger.warn("Telegram Mini App 登录失败：请求体解析失败", error);
+      return errorResponse("请求格式不正确，请使用 JSON", 400);
+    }
+
+    const rawInitData =
+      typeof body?.initData === "string"
+        ? body.initData
+        : typeof body?.init_data === "string"
+        ? body.init_data
+        : "";
+    const initData = rawInitData.trim();
+    const remember = this.parseBoolean(body?.remember, true);
+    const trustToken =
+      typeof body?.twoFactorTrustToken === "string"
+        ? body.twoFactorTrustToken.trim()
+        : "";
+
+    if (!initData) {
+      return errorResponse("缺少 Telegram initData", 400);
+    }
+
+    const botToken =
+      (
+        await this.configManager.getSystemConfig(
+          "telegram_bot_token",
+          ensureString(this.env.TELEGRAM_BOT_TOKEN, "")
+        )
+      )?.trim() || "";
+    if (!botToken) {
+      return errorResponse("未配置 telegram_bot_token，请联系管理员", 503);
+    }
+
+    const verifyResult = await this.verifyTelegramInitData(initData, botToken);
+    if (!verifyResult.ok || !verifyResult.user) {
+      this.logger.warn("Telegram Mini App 登录失败：initData 校验失败", {
+        reason: verifyResult.reason,
+      });
+      return errorResponse(verifyResult.reason || "Telegram 数据校验失败", 401);
+    }
+
+    await this.db.ensureUsersTelegramColumns();
+
+    const telegramId = String(verifyResult.user.id);
+    const clientIP =
+      request.headers.get("CF-Connecting-IP") ||
+      request.headers.get("X-Forwarded-For") ||
+      request.headers.get("X-Real-IP") ||
+      "unknown";
+    const userAgent = request.headers.get("User-Agent") || "";
+
+    const user = await this.db.db
+      .prepare("SELECT * FROM users WHERE telegram_id = ? LIMIT 1")
+      .bind(telegramId)
+      .first<AuthUserRow>();
+
+    if (!user) {
+      this.logger.warn("Telegram Mini App 登录失败：未绑定账号", {
+        telegram_id: telegramId,
+        login_ip: clientIP,
+      });
+      return errorResponse("当前 Telegram 未绑定账号，请先在面板完成绑定", 404);
+    }
+
+    const expireTime = user.expire_time
+      ? new Date(
+          typeof user.expire_time === "string"
+            ? user.expire_time
+            : String(user.expire_time)
+        )
+      : null;
+    if (expireTime && expireTime < new Date()) {
+      await this.db.db
+        .prepare(
+          `INSERT INTO login_logs (user_id, login_ip, user_agent, login_status, failure_reason, login_method) VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .bind(user.id, clientIP, userAgent, 0, "账户过期", "telegram_miniapp")
+        .run();
+      return errorResponse("账户已过期，请联系管理员续费", 403);
+    }
+
+    if (await this.shouldRequireTwoFactor(user, trustToken)) {
+      const challengeId = await this.createTwoFactorChallenge({
+        userId: user.id,
+        remember,
+        loginMethod: "telegram_miniapp",
+        clientIP,
+        userAgent,
+        meta: {
+          provider: "telegram",
+          telegram_id: telegramId,
+        },
+      });
+      return successResponse({
+        need_2fa: true,
+        challenge_id: challengeId,
+        two_factor_enabled: true,
+        provider: "telegram",
+      });
+    }
+
+    return this.finalizeLogin(
+      user,
+      remember,
+      "telegram_miniapp",
+      clientIP,
+      userAgent,
+      {
+        provider: "telegram",
+      }
+    );
   }
 
   async verifyTwoFactor(request) {
