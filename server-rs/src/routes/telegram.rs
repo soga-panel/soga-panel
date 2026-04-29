@@ -229,6 +229,7 @@ async fn post_webhook(
         "link" => handle_sublink_command(&state, &config, &chat_id).await,
         "panel" => handle_panel_command(&state, &config, &chat_id).await,
         "notify" => handle_notify_command(&state, &config, &chat_id, &command.arg).await,
+        "id" => handle_id_command(&config, message, &chat_id).await,
         "help" => handle_help_command(&config, &chat_id).await,
         _ => Ok(json!({ "ok": true, "skipped": "unsupported_command" })),
     };
@@ -1136,6 +1137,51 @@ async fn handle_panel_command(
 async fn handle_help_command(config: &TelegramBotConfig, chat_id: &str) -> Result<Value, String> {
     let _ = send_telegram_message(config, chat_id, &build_help_text(), None).await;
     Ok(json!({ "ok": true, "command": "help" }))
+}
+
+async fn handle_id_command(
+    config: &TelegramBotConfig,
+    message: &Value,
+    chat_id: &str,
+) -> Result<Value, String> {
+    let user_id = message
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(value_to_chat_id)
+        .unwrap_or_default();
+    let chat_type = message
+        .get("chat")
+        .and_then(|chat| chat.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let thread_id = value_to_thread_id(message.get("message_thread_id"));
+
+    let mut lines = vec![
+        "ID 信息：".to_string(),
+        format!(
+            "用户 ID：{}",
+            if user_id.trim().is_empty() {
+                "-"
+            } else {
+                user_id.trim()
+            }
+        ),
+        format!("聊天 ID：{}", chat_id),
+        format!("聊天类型：{}", chat_type),
+    ];
+    if thread_id > 0 {
+        lines.push(format!("话题 ID：{}", thread_id));
+    }
+
+    let _ = send_telegram_message(config, chat_id, &lines.join("\n"), None).await;
+    Ok(json!({
+      "ok": true,
+      "command": "id",
+      "user_id": if user_id.trim().is_empty() { Value::Null } else { json!(user_id.trim()) },
+      "chat_id": chat_id,
+      "chat_type": chat_type,
+      "message_thread_id": if thread_id > 0 { json!(thread_id) } else { Value::Null }
+    }))
 }
 
 async fn handle_notify_command(

@@ -287,6 +287,9 @@ export class TelegramAPI {
       if (command.name === "notify") {
         return await this.handleNotifyCommand(chatId, command.arg, botConfig);
       }
+      if (command.name === "id") {
+        return await this.handleIdCommand(message, chatId, botConfig);
+      }
       if (command.name === "help") {
         return await this.handleHelpCommand(chatId, botConfig);
       }
@@ -1262,6 +1265,36 @@ export class TelegramAPI {
   private async handleHelpCommand(chatId: string, botConfig: TelegramBotConfig) {
     await this.sendMessageIfEnabled(botConfig, chatId, this.buildHelpText());
     return successResponse({ ok: true, command: "help" });
+  }
+
+  private async handleIdCommand(
+    message: TelegramMessage,
+    chatId: string,
+    botConfig: TelegramBotConfig
+  ) {
+    const userId = this.normalizeChatId(message.from?.id);
+    const chatType = ensureString(message.chat?.type, "").trim() || "unknown";
+    const threadId = this.normalizeThreadId(message.message_thread_id);
+
+    const lines = [
+      "ID 信息：",
+      `用户 ID：${userId || "-"}`,
+      `聊天 ID：${chatId}`,
+      `聊天类型：${chatType}`,
+    ];
+    if (threadId > 0) {
+      lines.push(`话题 ID：${threadId}`);
+    }
+
+    await this.sendMessageIfEnabled(botConfig, chatId, lines.join("\n"));
+    return successResponse({
+      ok: true,
+      command: "id",
+      user_id: userId || null,
+      chat_id: chatId,
+      chat_type: chatType,
+      message_thread_id: threadId > 0 ? threadId : null,
+    });
   }
 
   private async handleNotifyCommand(
