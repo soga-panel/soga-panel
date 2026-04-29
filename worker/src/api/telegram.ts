@@ -18,8 +18,14 @@ type DbRow = Record<string, unknown>;
 type TelegramMessage = {
   text?: string;
   message_id?: string | number | bigint;
+  message_thread_id?: string | number | bigint;
+  from?: {
+    id?: string | number | bigint;
+    is_bot?: boolean;
+  };
   chat?: {
     id?: string | number | bigint;
+    type?: string;
   };
 };
 
@@ -63,6 +69,25 @@ type BoundTelegramUser = {
   status: number;
   token: string;
   telegram_enabled: number;
+};
+
+type TicketTopicBindingRow = {
+  ticket_id?: number;
+  group_chat_id?: string;
+  message_thread_id?: number;
+};
+
+type TicketBasicRow = {
+  id?: number;
+  user_id?: number;
+  title?: string;
+  status?: string;
+};
+
+type TicketOperatorRow = {
+  id?: number;
+  is_admin?: number;
+  username?: string;
 };
 
 type TelegramCommand = {
@@ -109,6 +134,7 @@ const REGISTER_HUMAN_CODE_CHARSET =
 const REGISTER_HUMAN_CODE_REGEX = /^[2-9A-HJ-NP-Z]+$/;
 const REGISTER_CAPTCHA_CALLBACK_PREFIX = "regcap:";
 const REGISTER_INVITE_SKIP_INPUTS = ["skip", "none", "-", "无", "跳过"];
+const TELEGRAM_CHAT_ID_REGEX = /^-?\d{5,20}$/;
 const SUBSCRIPTION_TYPES: { type: SubscriptionType; label: string }[] = [
   { type: "v2ray", label: "V2Ray" },
   { type: "clash", label: "Clash" },
@@ -181,6 +207,7 @@ export class TelegramAPI {
     try {
       await this.db.ensureUsersTelegramColumns();
       await this.db.ensureTelegramRegisterSessionTable();
+      await this.db.ensureTelegramTicketTopicsTable();
       await this.db.cleanupExpiredTelegramRegisterSessions();
 
       const botConfig = await this.loadBotConfig();
@@ -205,13 +232,26 @@ export class TelegramAPI {
       }
 
       const message = this.extractMessage(payload);
-      if (!message?.text) {
-        return successResponse({ ok: true, skipped: "no_text_message" });
+      if (!message) {
+        return successResponse({ ok: true, skipped: "no_message" });
       }
 
       const chatId = this.normalizeChatId(message.chat?.id);
       if (!chatId) {
         return successResponse({ ok: true, skipped: "no_chat_id" });
+      }
+
+      const topicReplyHandled = await this.handleTicketTopicReply(
+        message,
+        chatId,
+        botConfig
+      );
+      if (topicReplyHandled) {
+        return topicReplyHandled;
+      }
+
+      if (!message.text) {
+        return successResponse({ ok: true, skipped: "no_text_message" });
       }
 
       const command = this.parseCommand(message.text);
@@ -1488,6 +1528,171 @@ export class TelegramAPI {
       return raw.toString();
     }
     return "";
+  }
+
+  private normalizeThreadId(raw: unknown): number {
+    if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+      return Math.trunc(raw);
+    }
+    if (typeof raw === "string") {
+      const parsed = Number.parseInt(raw.trim(), 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+    if (typeof raw === "bigint" && raw > 0n && raw <= BigInt(Number.MAX_SAFE_INTEGER)) {
+      return Number(raw);
+    }
+    return 0;
+  }
+
+  private async loadTicketGroupChatId(): Promise<string> {
+    const value = (
+      await this.configManager.getSystemConfig("telegram_ticket_group_id", "")
+    )?.trim() || "";
+    if (!TELEGRAM_CHAT_ID_REGEX.test(value)) {
+      return "";
+    }
+    return value;
+  }
+
+  private async handleTicketTopicReply(
+    message: TelegramMessage,
+    chatId: string,
+    botConfig: TelegramBotConfig
+  ): Promise<Response | null> {
+    const ticketGroupChatId = await this.loadTicketGroupChatId();
+    if (!ticketGroupChatId || chatId !== ticketGroupChatId) {
+      return null;
+    }
+
+    const threadId = this.normalizeThreadId(message.message_thread_id);
+    if (threadId <= 0) {
+      return successResponse({ ok: true, skipped: "ticket_topic_missing_thread_id" });
+    }
+
+    if (message.from?.is_bot) {
+      return successResponse({ ok: true, skipped: "ticket_topic_sender_is_bot" });
+    }
+
+    const replyText = ensureString(message.text, "").trim();
+    if (!replyText) {
+      return successResponse({ ok: true, skipped: "ticket_topic_empty_text" });
+    }
+
+    const operatorTelegramId = this.normalizeChatId(message.from?.id);
+    if (!operatorTelegramId) {
+      return successResponse({ ok: true, skipped: "ticket_topic_missing_sender_id" });
+    }
+
+    const operator = await this.db.db
+      .prepare(
+        `
+          SELECT id, is_admin, username
+          FROM users
+          WHERE telegram_id = ?
+          LIMIT 1
+        `
+      )
+      .bind(operatorTelegramId)
+      .first<TicketOperatorRow | null>();
+    if (!operator || ensureNumber(operator.is_admin, 0) !== 1) {
+      return successResponse({ ok: true, skipped: "ticket_topic_sender_not_admin" });
+    }
+    const operatorId = ensureNumber(operator.id, 0);
+    if (operatorId <= 0) {
+      return successResponse({ ok: true, skipped: "ticket_topic_invalid_admin_id" });
+    }
+
+    const topicBinding = await this.db.db
+      .prepare(
+        `
+          SELECT ticket_id, group_chat_id, message_thread_id
+          FROM ticket_telegram_topics
+          WHERE group_chat_id = ? AND message_thread_id = ?
+          LIMIT 1
+        `
+      )
+      .bind(ticketGroupChatId, threadId)
+      .first<TicketTopicBindingRow | null>();
+    const ticketId = ensureNumber(topicBinding?.ticket_id, 0);
+    if (ticketId <= 0) {
+      return successResponse({ ok: true, skipped: "ticket_topic_not_mapped" });
+    }
+
+    const ticket = await this.db.db
+      .prepare(
+        `
+          SELECT id, user_id, title, status
+          FROM tickets
+          WHERE id = ?
+          LIMIT 1
+        `
+      )
+      .bind(ticketId)
+      .first<TicketBasicRow | null>();
+    if (!ticket) {
+      return successResponse({ ok: true, skipped: "ticket_topic_ticket_missing" });
+    }
+
+    await this.db.db
+      .prepare(
+        `
+          INSERT INTO ticket_replies (ticket_id, author_id, author_role, content, created_at)
+          VALUES (?, ?, 'admin', ?, datetime('now', '+8 hours'))
+        `
+      )
+      .bind(ticketId, operatorId, replyText)
+      .run();
+
+    await this.db.db
+      .prepare(
+        `
+          UPDATE tickets
+          SET status = 'answered',
+              last_reply_by_admin_id = ?,
+              last_reply_at = datetime('now', '+8 hours'),
+              updated_at = datetime('now', '+8 hours')
+          WHERE id = ?
+        `
+      )
+      .bind(operatorId, ticketId)
+      .run();
+
+    const ticketUserId = ensureNumber(ticket.user_id, 0);
+    if (ticketUserId > 0) {
+      const ticketOwner = await this.db.db
+        .prepare("SELECT telegram_id FROM users WHERE id = ? LIMIT 1")
+        .bind(ticketUserId)
+        .first<{ telegram_id?: string | null } | null>();
+      const ownerChatId = this.normalizeChatId(ticketOwner?.telegram_id);
+      if (ownerChatId) {
+        const operatorName =
+          ensureString(operator.username, "").trim() || `#${operatorId}`;
+        const ticketTitle = ensureString(ticket.title, "").trim();
+        await this.sendMessageIfEnabled(
+          botConfig,
+          ownerChatId,
+          [
+            `你的工单 #${ticketId} 已收到客服回复。`,
+            ticketTitle ? `标题：${ticketTitle}` : "",
+            `回复人：${operatorName}`,
+            "",
+            replyText,
+          ]
+            .filter(Boolean)
+            .join("\n")
+        );
+      }
+    }
+
+    return successResponse({
+      ok: true,
+      command: "ticket_topic_reply_forwarded",
+      ticket_id: ticketId,
+      operator_id: operatorId,
+      thread_id: threadId,
+    });
   }
 
   private async loadBotConfig(): Promise<TelegramBotConfig> {

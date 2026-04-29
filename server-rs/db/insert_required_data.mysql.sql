@@ -50,6 +50,7 @@ INSERT IGNORE INTO system_configs (`key`, value, description) VALUES
 ('telegram_bot_username', '', 'Telegram 机器人用户名（不含@，用于生成一键绑定链接）'),
 ('telegram_webhook_secret', '', 'Telegram Webhook Secret Token（可选）'),
 ('telegram_miniapp_url', '', 'Telegram Mini App 打开地址（为空时自动使用 site_url）'),
+('telegram_ticket_group_id', '', 'Telegram 工单转发群组 ID（需开启论坛话题）'),
 ('rebate_rate', '0', '邀请返利比例（0-1之间，例如0.1表示10%）'),
 ('rebate_mode', 'every_order', '返利模式：first_order（首单）或 every_order（循环）'),
 ('rebate_withdraw_fee_rate', '0.05', '返利提现手续费比例（0-1之间，例如0.05=5%）'),

@@ -41,6 +41,7 @@ const REGISTER_HUMAN_CODE_LENGTH: usize = 8;
 const REGISTER_HUMAN_CODE_DIGITS: &str = "23456789";
 const REGISTER_HUMAN_CODE_LETTERS: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 const REGISTER_INVITE_SKIP_INPUTS: [&str; 5] = ["skip", "none", "-", "无", "跳过"];
+const TELEGRAM_TICKET_TEXT_MAX_LEN: usize = 3800;
 
 struct TelegramBotConfig {
     token: String,
@@ -138,6 +139,9 @@ async fn post_webhook(
     if let Err(message) = ensure_telegram_register_session_table(&state).await {
         return error(StatusCode::INTERNAL_SERVER_ERROR, &message, None);
     }
+    if let Err(message) = ensure_ticket_telegram_topics_table(&state).await {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, &message, None);
+    }
     let _ = cleanup_expired_register_sessions(&state).await;
 
     let config = match load_telegram_bot_config(&state).await {
@@ -170,15 +174,6 @@ async fn post_webhook(
                 .into_response();
         }
     };
-    let text = message
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    if text.is_empty() {
-        return success(json!({ "ok": true, "skipped": "empty_text" }), "Success").into_response();
-    }
-
     let chat_id = message
         .get("chat")
         .and_then(|chat| chat.get("id"))
@@ -193,6 +188,21 @@ async fn post_webhook(
             .into_response();
         }
     };
+
+    match handle_ticket_topic_reply_message(&state, &config, message, &chat_id).await {
+        Ok(Some(payload)) => return success(payload, "Success").into_response(),
+        Ok(None) => {}
+        Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, &message, None),
+    }
+
+    let text = message
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if text.is_empty() {
+        return success(json!({ "ok": true, "skipped": "empty_text" }), "Success").into_response();
+    }
 
     let command = match parse_command(text) {
         Some(value) => value,
@@ -478,7 +488,9 @@ async fn handle_register_text_input(
 
     let text = message_text.trim();
     if text.is_empty() {
-        return Ok(Some(json!({ "ok": true, "skipped": "empty_register_input" })));
+        return Ok(Some(
+            json!({ "ok": true, "skipped": "empty_register_input" }),
+        ));
     }
 
     let payload = match session.stage {
@@ -505,7 +517,8 @@ async fn handle_register_text_input(
             if is_six_digit_code(text) {
                 complete_register_by_email_code(state, config, headers, chat_id, text).await?
             } else {
-                let _ = send_telegram_message(config, chat_id, "请发送 6 位邮箱验证码。", None).await;
+                let _ =
+                    send_telegram_message(config, chat_id, "请发送 6 位邮箱验证码。", None).await;
                 json!({ "ok": true, "skipped": "awaiting_email_code" })
             }
         }
@@ -674,7 +687,8 @@ async fn handle_register_email_input(
 
     let email = email_raw.trim().to_lowercase();
     if !is_valid_email(&email) {
-        let _ = send_telegram_message(config, chat_id, "邮箱格式无效，请重新输入邮箱。", None).await;
+        let _ =
+            send_telegram_message(config, chat_id, "邮箱格式无效，请重新输入邮箱。", None).await;
         return Ok(json!({ "ok": true, "skipped": "register_invalid_email" }));
     }
     if is_gmail_alias(&email) {
@@ -825,7 +839,10 @@ async fn handle_register_invite_input(
         config,
         chat_id,
         &[
-            format!("已向 {} 发送邮箱验证码（有效期约 {} 分钟）。", email, expire_minutes),
+            format!(
+                "已向 {} 发送邮箱验证码（有效期约 {} 分钟）。",
+                email, expire_minutes
+            ),
             "请直接发送 6 位验证码完成注册。".to_string(),
         ]
         .join("\n"),
@@ -1610,9 +1627,12 @@ fn generate_register_human_code() -> String {
     let mut rng = rand::thread_rng();
     let digits: Vec<char> = REGISTER_HUMAN_CODE_DIGITS.chars().collect();
     let letters: Vec<char> = REGISTER_HUMAN_CODE_LETTERS.chars().collect();
-    let charset: Vec<char> = format!("{}{}", REGISTER_HUMAN_CODE_DIGITS, REGISTER_HUMAN_CODE_LETTERS)
-        .chars()
-        .collect();
+    let charset: Vec<char> = format!(
+        "{}{}",
+        REGISTER_HUMAN_CODE_DIGITS, REGISTER_HUMAN_CODE_LETTERS
+    )
+    .chars()
+    .collect();
 
     let mut chars = Vec::with_capacity(REGISTER_HUMAN_CODE_LENGTH);
     chars.push(digits[rng.gen_range(0..digits.len())]);
@@ -1760,7 +1780,10 @@ async fn send_register_email_code(
             .and_then(|item| item.try_get::<Option<i64>, _>("count").ok().flatten())
             .unwrap_or(0);
         if count > 0 {
-            return Err(format!("验证码发送频繁，请在 {} 秒后重试", cooldown_seconds));
+            return Err(format!(
+                "验证码发送频繁，请在 {} 秒后重试",
+                cooldown_seconds
+            ));
         }
     }
 
@@ -1919,7 +1942,10 @@ async fn verify_email_code_for_register(
         None => return Err("验证码不存在或已过期".to_string()),
     };
 
-    let id = row.try_get::<Option<i64>, _>("id").unwrap_or(Some(0)).unwrap_or(0);
+    let id = row
+        .try_get::<Option<i64>, _>("id")
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
     let code_hash = row
         .try_get::<Option<String>, _>("code_hash")
         .ok()
@@ -1951,10 +1977,11 @@ async fn verify_email_code_for_register(
         return Err("验证码错误".to_string());
     }
 
-    let _ = sqlx::query("UPDATE email_verification_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(id)
-        .execute(&state.db)
-        .await;
+    let _ =
+        sqlx::query("UPDATE email_verification_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(id)
+            .execute(&state.db)
+            .await;
     Ok(())
 }
 
@@ -2027,8 +2054,14 @@ async fn register_by_email_code(
     .await?;
 
     if let Some(inviter_id) = inviter_id {
-        save_referral_relation(state, inviter_id, user_id, &invite_code, get_client_ip(headers))
-            .await;
+        save_referral_relation(
+            state,
+            inviter_id,
+            user_id,
+            &invite_code,
+            get_client_ip(headers),
+        )
+        .await;
         increment_invite_usage(state, inviter_id).await;
     }
 
@@ -2365,6 +2398,292 @@ async fn load_telegram_bot_config(state: &AppState) -> Result<TelegramBotConfig,
         api_base,
         webhook_secret,
     })
+}
+
+async fn ensure_ticket_telegram_topics_table(state: &AppState) -> Result<(), String> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS ticket_telegram_topics (
+          ticket_id BIGINT NOT NULL COMMENT '工单 ID',
+          group_chat_id VARCHAR(64) NOT NULL COMMENT 'Telegram 论坛群组 Chat ID',
+          message_thread_id BIGINT NOT NULL COMMENT 'Telegram 论坛话题 Thread ID',
+          topic_message_id BIGINT COMMENT '创建话题时的消息 ID（可选）',
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+          CONSTRAINT fk_ticket_tg_topics_ticket FOREIGN KEY (ticket_id) REFERENCES tickets (id) ON DELETE CASCADE,
+          UNIQUE KEY uk_ticket_tg_topics_ticket (ticket_id),
+          UNIQUE KEY uk_ticket_tg_topics_group_thread (group_chat_id, message_thread_id),
+          INDEX idx_ticket_tg_topics_thread (message_thread_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        "#,
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+async fn load_ticket_group_chat_id(state: &AppState) -> Result<String, String> {
+    let row = sqlx::query(
+        "SELECT value FROM system_configs WHERE `key` = 'telegram_ticket_group_id' LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+    let value = row
+        .and_then(|item| item.try_get::<Option<String>, _>("value").ok().flatten())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if is_valid_chat_id_text(&value) {
+        Ok(value)
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn is_valid_chat_id_text(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut chars = trimmed.chars();
+    if let Some(first) = chars.next() {
+        if first == '-' {
+            return chars.all(|ch| ch.is_ascii_digit());
+        }
+        if first.is_ascii_digit() {
+            return chars.all(|ch| ch.is_ascii_digit());
+        }
+    }
+    false
+}
+
+fn value_to_thread_id(value: Option<&Value>) -> i64 {
+    value
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            value
+                .and_then(Value::as_str)
+                .and_then(|text| text.trim().parse::<i64>().ok())
+        })
+        .filter(|id| *id > 0)
+        .unwrap_or(0)
+}
+
+fn truncate_ticket_text(text: &str, max_len: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in trimmed.chars().take(max_len) {
+        out.push(ch);
+    }
+    if trimmed.chars().count() > max_len {
+        out.push_str("...");
+    }
+    out
+}
+
+async fn handle_ticket_topic_reply_message(
+    state: &AppState,
+    config: &TelegramBotConfig,
+    message: &Value,
+    chat_id: &str,
+) -> Result<Option<Value>, String> {
+    let ticket_group_chat_id = load_ticket_group_chat_id(state).await?;
+    if ticket_group_chat_id.is_empty() || ticket_group_chat_id != chat_id {
+        return Ok(None);
+    }
+
+    let thread_id = value_to_thread_id(message.get("message_thread_id"));
+    if thread_id <= 0 {
+        return Ok(Some(
+            json!({ "ok": true, "skipped": "ticket_topic_missing_thread_id" }),
+        ));
+    }
+
+    if message
+        .get("from")
+        .and_then(|from| from.get("is_bot"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(Some(
+            json!({ "ok": true, "skipped": "ticket_topic_sender_is_bot" }),
+        ));
+    }
+
+    let reply_text = message
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if reply_text.is_empty() {
+        return Ok(Some(
+            json!({ "ok": true, "skipped": "ticket_topic_empty_text" }),
+        ));
+    }
+
+    let sender_telegram_id = message
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(value_to_chat_id)
+        .unwrap_or_default();
+    if sender_telegram_id.is_empty() {
+        return Ok(Some(
+            json!({ "ok": true, "skipped": "ticket_topic_missing_sender" }),
+        ));
+    }
+
+    let operator =
+        sqlx::query("SELECT id, is_admin, username FROM users WHERE telegram_id = ? LIMIT 1")
+            .bind(&sender_telegram_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|err| err.to_string())?;
+    let operator = match operator {
+        Some(value) => value,
+        None => {
+            return Ok(Some(
+                json!({ "ok": true, "skipped": "ticket_topic_sender_not_bound" }),
+            ))
+        }
+    };
+    let operator_id = operator
+        .try_get::<Option<i64>, _>("id")
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+    let operator_is_admin = operator
+        .try_get::<Option<i64>, _>("is_admin")
+        .unwrap_or(Some(0))
+        .unwrap_or(0)
+        == 1;
+    if operator_id <= 0 || !operator_is_admin {
+        return Ok(Some(
+            json!({ "ok": true, "skipped": "ticket_topic_sender_not_admin" }),
+        ));
+    }
+    let operator_name = operator
+        .try_get::<Option<String>, _>("username")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| format!("#{}", operator_id));
+
+    let ticket_binding = sqlx::query(
+        r#"
+        SELECT ticket_id
+        FROM ticket_telegram_topics
+        WHERE group_chat_id = ? AND message_thread_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(chat_id)
+    .bind(thread_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+    let ticket_id = ticket_binding
+        .as_ref()
+        .and_then(|row| row.try_get::<Option<i64>, _>("ticket_id").ok().flatten())
+        .unwrap_or(0);
+    if ticket_id <= 0 {
+        return Ok(Some(
+            json!({ "ok": true, "skipped": "ticket_topic_not_mapped" }),
+        ));
+    }
+
+    let ticket = sqlx::query("SELECT id, user_id, title FROM tickets WHERE id = ? LIMIT 1")
+        .bind(ticket_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|err| err.to_string())?;
+    let ticket = match ticket {
+        Some(value) => value,
+        None => {
+            return Ok(Some(
+                json!({ "ok": true, "skipped": "ticket_topic_ticket_missing" }),
+            ))
+        }
+    };
+    let ticket_user_id = ticket
+        .try_get::<Option<i64>, _>("user_id")
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+    let ticket_title = ticket
+        .try_get::<Option<String>, _>("title")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| format!("工单 #{}", ticket_id));
+
+    sqlx::query(
+        r#"
+        INSERT INTO ticket_replies (ticket_id, author_id, author_role, content, created_at)
+        VALUES (?, ?, 'admin', ?, CURRENT_TIMESTAMP)
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(operator_id)
+    .bind(reply_text)
+    .execute(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+
+    sqlx::query(
+        r#"
+        UPDATE tickets
+        SET status = 'answered',
+            last_reply_by_admin_id = ?,
+            last_reply_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        "#,
+    )
+    .bind(operator_id)
+    .bind(ticket_id)
+    .execute(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+
+    if ticket_user_id > 0 {
+        let owner = sqlx::query("SELECT telegram_id FROM users WHERE id = ? LIMIT 1")
+            .bind(ticket_user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|err| err.to_string())?;
+        let owner_chat_id = owner
+            .and_then(|row| {
+                row.try_get::<Option<String>, _>("telegram_id")
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_default();
+        if !owner_chat_id.trim().is_empty() {
+            let _ = send_telegram_message(
+                config,
+                owner_chat_id.trim(),
+                &[
+                    format!("你的工单 #{} 已收到客服回复。", ticket_id),
+                    format!("标题：{}", ticket_title),
+                    format!("回复人：{}", operator_name),
+                    String::new(),
+                    truncate_ticket_text(reply_text, TELEGRAM_TICKET_TEXT_MAX_LEN),
+                ]
+                .join("\n"),
+                None,
+            )
+            .await;
+        }
+    }
+
+    Ok(Some(json!({
+      "ok": true,
+      "command": "ticket_topic_reply_forwarded",
+      "ticket_id": ticket_id,
+      "operator_id": operator_id,
+      "thread_id": thread_id
+    })))
 }
 
 async fn fetch_bound_user_by_chat_id(

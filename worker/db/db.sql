@@ -1013,6 +1013,22 @@ CREATE TABLE
         FOREIGN KEY (author_id) REFERENCES users (id) ON DELETE CASCADE
     );
 
+-- 工单与 Telegram 论坛话题映射表
+-- ticket_id: 工单 ID（唯一）
+-- group_chat_id: Telegram 论坛群组 ID
+-- message_thread_id: 对应论坛话题 thread id
+-- topic_message_id: 创建话题时系统消息 id（可选）
+CREATE TABLE
+    IF NOT EXISTS ticket_telegram_topics (
+        ticket_id INTEGER PRIMARY KEY,
+        group_chat_id TEXT NOT NULL,
+        message_thread_id INTEGER NOT NULL,
+        topic_message_id INTEGER,
+        created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+        updated_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+        FOREIGN KEY (ticket_id) REFERENCES tickets (id) ON DELETE CASCADE
+    );
+
 
 -- =============================================
 -- 创建索引以优化查询性能
@@ -1129,3 +1145,4 @@ CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets (status);
 CREATE INDEX IF NOT EXISTS idx_tickets_last_reply_at ON tickets (last_reply_at);
 CREATE INDEX IF NOT EXISTS idx_ticket_replies_ticket_id ON ticket_replies (ticket_id);
 CREATE INDEX IF NOT EXISTS idx_ticket_replies_author_role ON ticket_replies (author_role);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_tg_topics_group_thread ON ticket_telegram_topics (group_chat_id, message_thread_id);

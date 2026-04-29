@@ -11,6 +11,8 @@ export class DatabaseService {
   private telegramColumnsReady = false;
   private telegramRegisterSessionChecked = false;
   private telegramRegisterSessionReady = false;
+  private telegramTicketTopicsChecked = false;
+  private telegramTicketTopicsReady = false;
   private xraySchemaChecked = false;
   private xraySchemaReady = false;
 
@@ -190,6 +192,47 @@ export class DatabaseService {
       )
       .bind(nowUnix)
       .run();
+  }
+
+  async ensureTelegramTicketTopicsTable() {
+    if (this.telegramTicketTopicsChecked && this.telegramTicketTopicsReady) {
+      return true;
+    }
+
+    try {
+      await this.db
+        .prepare(
+          `
+          CREATE TABLE IF NOT EXISTS ticket_telegram_topics (
+            ticket_id INTEGER PRIMARY KEY,
+            group_chat_id TEXT NOT NULL,
+            message_thread_id INTEGER NOT NULL,
+            topic_message_id INTEGER,
+            created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+            updated_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+            FOREIGN KEY (ticket_id) REFERENCES tickets (id) ON DELETE CASCADE
+          )
+        `
+        )
+        .run();
+
+      await this.db
+        .prepare(
+          `
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_tg_topics_group_thread
+          ON ticket_telegram_topics (group_chat_id, message_thread_id)
+        `
+        )
+        .run();
+
+      this.telegramTicketTopicsReady = true;
+      this.telegramTicketTopicsChecked = true;
+    } catch (error) {
+      console.error("ensureTelegramTicketTopicsTable error:", error);
+      this.telegramTicketTopicsReady = false;
+    }
+
+    return this.telegramTicketTopicsReady;
   }
 
   private normalizeIdList(value: unknown): number[] {

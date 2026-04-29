@@ -27,6 +27,8 @@ use super::auth::{
 
 const TELEGRAM_BIND_CODE_LEN: usize = 16;
 const TELEGRAM_BIND_CODE_TTL_SECONDS: i64 = 15 * 60;
+const TELEGRAM_TICKET_TOPIC_MAX_LEN: usize = 128;
+const TELEGRAM_TICKET_TEXT_MAX_LEN: usize = 3800;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -2664,6 +2666,9 @@ async fn post_ticket(
         }),
     };
 
+    let _ =
+        forward_user_ticket_to_telegram_topic(&state, ticket_id, user_id, &title, &content).await;
+
     success(ticket, "工单已提交").into_response()
 }
 
@@ -2734,7 +2739,7 @@ async fn post_ticket_reply(
         return error(StatusCode::BAD_REQUEST, "回复内容不能为空", None);
     }
 
-    let ticket_row = sqlx::query("SELECT id, user_id FROM tickets WHERE id = ?")
+    let ticket_row = sqlx::query("SELECT id, user_id, title FROM tickets WHERE id = ?")
         .bind(ticket_id)
         .fetch_optional(&state.db)
         .await;
@@ -2747,6 +2752,11 @@ async fn post_ticket_reply(
         None => return error(StatusCode::NOT_FOUND, "未找到工单", None),
     };
     let ticket_user = ticket_row.try_get::<i64, _>("user_id").unwrap_or(0);
+    let ticket_title = ticket_row
+        .try_get::<Option<String>, _>("title")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| format!("工单 #{}", ticket_id));
     if ticket_user != user_id {
         return error(StatusCode::NOT_FOUND, "未找到工单", None);
     }
@@ -2779,6 +2789,15 @@ async fn post_ticket_reply(
     if let Err(err) = update_result {
         return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string(), None);
     }
+
+    let _ = forward_user_ticket_reply_to_telegram_topic(
+        &state,
+        ticket_id,
+        user_id,
+        &ticket_title,
+        &content,
+    )
+    .await;
 
     let replies = match list_ticket_replies(&state, ticket_id).await {
         Ok(value) => value,
@@ -4182,6 +4201,311 @@ async fn update_user_telegram_settings(
     .await
     .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+#[derive(Clone)]
+struct TelegramTicketDispatchConfig {
+    token: String,
+    api_base: String,
+    group_chat_id: String,
+}
+
+fn truncate_ticket_text(value: &str, max_len: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in trimmed.chars().take(max_len) {
+        out.push(ch);
+    }
+    if trimmed.chars().count() > max_len {
+        out.push_str("...");
+    }
+    out
+}
+
+fn build_ticket_topic_name(ticket_id: i64, title: &str) -> String {
+    let prefix = format!("工单 #{}", ticket_id);
+    let compact_title = title.split_whitespace().collect::<Vec<&str>>().join(" ");
+    if compact_title.is_empty() {
+        return prefix;
+    }
+    let remain = TELEGRAM_TICKET_TOPIC_MAX_LEN.saturating_sub(prefix.chars().count() + 1);
+    if remain == 0 {
+        return prefix.chars().take(TELEGRAM_TICKET_TOPIC_MAX_LEN).collect();
+    }
+    format!(
+        "{} {}",
+        prefix,
+        truncate_ticket_text(&compact_title, remain)
+    )
+    .chars()
+    .take(TELEGRAM_TICKET_TOPIC_MAX_LEN)
+    .collect()
+}
+
+async fn load_telegram_ticket_dispatch_config(
+    state: &AppState,
+) -> Result<Option<TelegramTicketDispatchConfig>, String> {
+    let rows = sqlx::query(
+        "SELECT `key`, `value` FROM system_configs WHERE `key` IN ('telegram_bot_token','telegram_bot_api_base','telegram_ticket_group_id')",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+
+    let mut token = String::new();
+    let mut api_base = "https://api.telegram.org".to_string();
+    let mut group_chat_id = String::new();
+    for row in rows {
+        let key = row
+            .try_get::<Option<String>, _>("key")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let value = row
+            .try_get::<Option<String>, _>("value")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if key == "telegram_bot_token" && !value.is_empty() {
+            token = value;
+        } else if key == "telegram_bot_api_base" && !value.is_empty() {
+            api_base = value;
+        } else if key == "telegram_ticket_group_id" && !value.is_empty() {
+            group_chat_id = value;
+        }
+    }
+
+    if token.is_empty() || !is_valid_telegram_chat_id(&group_chat_id) {
+        return Ok(None);
+    }
+
+    Ok(Some(TelegramTicketDispatchConfig {
+        token,
+        api_base,
+        group_chat_id,
+    }))
+}
+
+async fn ensure_ticket_telegram_topics_table(state: &AppState) -> Result<(), String> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS ticket_telegram_topics (
+          ticket_id BIGINT NOT NULL COMMENT '工单 ID',
+          group_chat_id VARCHAR(64) NOT NULL COMMENT 'Telegram 论坛群组 Chat ID',
+          message_thread_id BIGINT NOT NULL COMMENT 'Telegram 论坛话题 Thread ID',
+          topic_message_id BIGINT COMMENT '创建话题时的消息 ID（可选）',
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+          CONSTRAINT fk_ticket_tg_topics_ticket FOREIGN KEY (ticket_id) REFERENCES tickets (id) ON DELETE CASCADE,
+          UNIQUE KEY uk_ticket_tg_topics_ticket (ticket_id),
+          UNIQUE KEY uk_ticket_tg_topics_group_thread (group_chat_id, message_thread_id),
+          INDEX idx_ticket_tg_topics_thread (message_thread_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        "#,
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+async fn call_telegram_method(
+    config: &TelegramTicketDispatchConfig,
+    method: &str,
+    payload: Value,
+) -> Result<Option<Value>, String> {
+    if config.token.trim().is_empty() {
+        return Ok(None);
+    }
+    let endpoint = format!(
+        "{}/bot{}/{}",
+        config.api_base.trim_end_matches('/'),
+        config.token,
+        method
+    );
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .header("User-Agent", "Soga-Panel-Server/1.0")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let status = response.status();
+    let body = response.json::<Value>().await.unwrap_or(Value::Null);
+    if !status.is_success() || body.get("ok").and_then(Value::as_bool).unwrap_or(true) == false {
+        return Ok(None);
+    }
+    Ok(body.get("result").cloned())
+}
+
+async fn ensure_ticket_topic_thread(
+    state: &AppState,
+    config: &TelegramTicketDispatchConfig,
+    ticket_id: i64,
+    ticket_title: &str,
+) -> Result<Option<i64>, String> {
+    ensure_ticket_telegram_topics_table(state).await?;
+
+    let existing = sqlx::query(
+        r#"
+        SELECT message_thread_id
+        FROM ticket_telegram_topics
+        WHERE ticket_id = ? AND group_chat_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(&config.group_chat_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+    if let Some(row) = existing {
+        let thread_id = row
+            .try_get::<Option<i64>, _>("message_thread_id")
+            .unwrap_or(Some(0))
+            .unwrap_or(0);
+        if thread_id > 0 {
+            return Ok(Some(thread_id));
+        }
+    }
+
+    let topic_result = call_telegram_method(
+        config,
+        "createForumTopic",
+        json!({
+          "chat_id": config.group_chat_id,
+          "name": build_ticket_topic_name(ticket_id, ticket_title)
+        }),
+    )
+    .await?;
+    let thread_id = topic_result
+        .as_ref()
+        .and_then(|value| value.get("message_thread_id"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if thread_id <= 0 {
+        return Ok(None);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO ticket_telegram_topics (
+          ticket_id, group_chat_id, message_thread_id, created_at, updated_at
+        ) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON DUPLICATE KEY UPDATE
+          group_chat_id = VALUES(group_chat_id),
+          message_thread_id = VALUES(message_thread_id),
+          updated_at = CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(&config.group_chat_id)
+    .bind(thread_id)
+    .execute(&state.db)
+    .await
+    .map_err(|err| err.to_string())?;
+
+    Ok(Some(thread_id))
+}
+
+async fn send_ticket_message_to_topic(
+    state: &AppState,
+    config: &TelegramTicketDispatchConfig,
+    ticket_id: i64,
+    ticket_title: &str,
+    text: &str,
+) -> Result<(), String> {
+    let thread_id = ensure_ticket_topic_thread(state, config, ticket_id, ticket_title).await?;
+    let thread_id = match thread_id {
+        Some(value) if value > 0 => value,
+        _ => return Ok(()),
+    };
+
+    let _ = call_telegram_method(
+        config,
+        "sendMessage",
+        json!({
+          "chat_id": config.group_chat_id,
+          "message_thread_id": thread_id,
+          "text": truncate_ticket_text(text, TELEGRAM_TICKET_TEXT_MAX_LEN),
+          "disable_web_page_preview": true
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn resolve_ticket_user_display(
+    state: &AppState,
+    user_id: i64,
+) -> Result<(String, String), String> {
+    let row = sqlx::query("SELECT username, email FROM users WHERE id = ? LIMIT 1")
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|err| err.to_string())?;
+    let username = row
+        .as_ref()
+        .and_then(|item| item.try_get::<Option<String>, _>("username").ok().flatten())
+        .unwrap_or_else(|| format!("#{}", user_id));
+    let email = row
+        .as_ref()
+        .and_then(|item| item.try_get::<Option<String>, _>("email").ok().flatten())
+        .unwrap_or_else(|| "-".to_string());
+    Ok((username, email))
+}
+
+async fn forward_user_ticket_to_telegram_topic(
+    state: &AppState,
+    ticket_id: i64,
+    user_id: i64,
+    title: &str,
+    content: &str,
+) -> Result<(), String> {
+    let config = match load_telegram_ticket_dispatch_config(state).await? {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+    let (username, email) = resolve_ticket_user_display(state, user_id).await?;
+    let text = [
+        format!("📩 新工单 #{}", ticket_id),
+        format!("用户：{} (ID: {})", username, user_id),
+        format!("邮箱：{}", email),
+        format!("标题：{}", title.trim()),
+        String::new(),
+        "内容：".to_string(),
+        content.trim().to_string(),
+    ]
+    .join("\n");
+    send_ticket_message_to_topic(state, &config, ticket_id, title, &text).await
+}
+
+async fn forward_user_ticket_reply_to_telegram_topic(
+    state: &AppState,
+    ticket_id: i64,
+    user_id: i64,
+    title: &str,
+    content: &str,
+) -> Result<(), String> {
+    let config = match load_telegram_ticket_dispatch_config(state).await? {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+    let (username, _email) = resolve_ticket_user_display(state, user_id).await?;
+    let text = [
+        format!("💬 用户回复工单 #{}", ticket_id),
+        format!("用户：{} (ID: {})", username, user_id),
+        String::new(),
+        content.trim().to_string(),
+    ]
+    .join("\n");
+    send_ticket_message_to_topic(state, &config, ticket_id, title, &text).await
 }
 
 fn is_valid_telegram_chat_id(chat_id: &str) -> bool {

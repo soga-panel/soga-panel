@@ -37,9 +37,28 @@ type TicketReplyRow = {
   author_email?: string | null;
 };
 
+type TelegramTicketDispatchConfig = {
+  token: string;
+  apiBase: string;
+  groupChatId: string;
+};
+
+type TelegramTicketTopicRow = {
+  ticket_id?: number;
+  group_chat_id?: string;
+  message_thread_id?: number;
+};
+
+type TelegramUserRow = {
+  username?: string | null;
+  email?: string | null;
+};
+
 const MAX_TITLE_LENGTH = 120;
 const MAX_CONTENT_LENGTH = 8000;
 const TICKET_STATUSES: TicketStatus[] = ["open", "answered", "closed"];
+const TELEGRAM_TOPIC_MAX_LEN = 128;
+const TELEGRAM_GROUP_ID_REGEX = /^-?\d{5,20}$/;
 
 const isAuthFailure = (result: AuthResult): result is AuthFailure => result.success === false;
 
@@ -142,6 +161,260 @@ export class TicketAPI {
     return base;
   }
 
+  private normalizeTelegramGroupId(raw: unknown): string {
+    if (typeof raw === "string") {
+      const trimmed = raw.trim();
+      return TELEGRAM_GROUP_ID_REGEX.test(trimmed) ? trimmed : "";
+    }
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+      const value = Math.trunc(raw).toString();
+      return TELEGRAM_GROUP_ID_REGEX.test(value) ? value : "";
+    }
+    return "";
+  }
+
+  private normalizeTelegramThreadId(raw: unknown): number {
+    if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+      return Math.trunc(raw);
+    }
+    if (typeof raw === "string") {
+      const parsed = Number.parseInt(raw.trim(), 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+    return 0;
+  }
+
+  private limitText(value: string, maxLength: number): string {
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+    if (trimmed.length <= maxLength) return trimmed;
+    return `${trimmed.slice(0, Math.max(1, maxLength - 3))}...`;
+  }
+
+  private buildTicketTopicName(ticketId: number, title: string): string {
+    const prefix = `工单 #${ticketId}`;
+    const compactTitle = title.replace(/\s+/g, " ").trim();
+    if (!compactTitle) {
+      return prefix;
+    }
+    const remain = TELEGRAM_TOPIC_MAX_LEN - prefix.length - 1;
+    if (remain <= 0) {
+      return prefix.slice(0, TELEGRAM_TOPIC_MAX_LEN);
+    }
+    return `${prefix} ${this.limitText(compactTitle, remain)}`.slice(0, TELEGRAM_TOPIC_MAX_LEN);
+  }
+
+  private async loadTelegramTicketDispatchConfig(): Promise<TelegramTicketDispatchConfig | null> {
+    const rows = await this.db.db
+      .prepare(
+        `
+          SELECT key, value
+          FROM system_configs
+          WHERE key IN ('telegram_bot_token', 'telegram_bot_api_base', 'telegram_ticket_group_id')
+        `
+      )
+      .all<{ key?: string; value?: string }>();
+
+    let token = "";
+    let apiBase = "https://api.telegram.org";
+    let groupChatId = "";
+    for (const row of rows.results ?? []) {
+      const key = typeof row?.key === "string" ? row.key.trim() : "";
+      const value = typeof row?.value === "string" ? row.value.trim() : "";
+      if (!key) continue;
+      if (key === "telegram_bot_token" && value) {
+        token = value;
+      } else if (key === "telegram_bot_api_base" && value) {
+        apiBase = value;
+      } else if (key === "telegram_ticket_group_id" && value) {
+        groupChatId = this.normalizeTelegramGroupId(value);
+      }
+    }
+
+    if (!token || !groupChatId) {
+      return null;
+    }
+
+    return { token, apiBase, groupChatId };
+  }
+
+  private async callTelegramApi<T>(
+    config: TelegramTicketDispatchConfig,
+    method: string,
+    payload: Record<string, unknown>
+  ): Promise<T | null> {
+    const endpoint = `${config.apiBase.replace(/\/+$/, "")}/bot${config.token}/${method}`;
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "User-Agent": "Soga-Panel/1.0",
+        },
+        body: JSON.stringify(payload),
+      });
+      const body = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        result?: T;
+        description?: string;
+      };
+      if (!response.ok || body.ok === false) {
+        console.warn(
+          `Telegram ${method} failed:`,
+          response.status,
+          body?.description || "unknown"
+        );
+        return null;
+      }
+      return (body.result as T | undefined) ?? null;
+    } catch (error) {
+      console.warn(`Telegram ${method} error:`, error);
+      return null;
+    }
+  }
+
+  private async getOrCreateTelegramTicketThread(
+    config: TelegramTicketDispatchConfig,
+    ticketId: number,
+    ticketTitle: string
+  ): Promise<number | null> {
+    await this.db.ensureTelegramTicketTopicsTable();
+
+    const existing = await this.db.db
+      .prepare(
+        `
+          SELECT ticket_id, group_chat_id, message_thread_id
+          FROM ticket_telegram_topics
+          WHERE ticket_id = ? AND group_chat_id = ?
+          LIMIT 1
+        `
+      )
+      .bind(ticketId, config.groupChatId)
+      .first<TelegramTicketTopicRow | null>();
+    const existingThreadId = this.normalizeTelegramThreadId(existing?.message_thread_id);
+    if (existingThreadId > 0) {
+      return existingThreadId;
+    }
+
+    const topic = await this.callTelegramApi<{ message_thread_id?: number }>(
+      config,
+      "createForumTopic",
+      {
+        chat_id: config.groupChatId,
+        name: this.buildTicketTopicName(ticketId, ticketTitle),
+      }
+    );
+    const threadId = this.normalizeTelegramThreadId(topic?.message_thread_id);
+    if (threadId <= 0) {
+      return null;
+    }
+
+    await this.db.db
+      .prepare(
+        `
+          INSERT INTO ticket_telegram_topics (
+            ticket_id, group_chat_id, message_thread_id, created_at, updated_at
+          )
+          VALUES (?, ?, ?, datetime('now', '+8 hours'), datetime('now', '+8 hours'))
+          ON CONFLICT(ticket_id) DO UPDATE SET
+            group_chat_id = excluded.group_chat_id,
+            message_thread_id = excluded.message_thread_id,
+            updated_at = datetime('now', '+8 hours')
+        `
+      )
+      .bind(ticketId, config.groupChatId, threadId)
+      .run();
+
+    return threadId;
+  }
+
+  private async resolveUserDisplay(userId: number, fallbackUsername?: string, fallbackEmail?: string) {
+    if (fallbackUsername || fallbackEmail) {
+      return {
+        username: fallbackUsername?.trim() || `#${userId}`,
+        email: fallbackEmail?.trim() || "-",
+      };
+    }
+    const row = await this.db.db
+      .prepare("SELECT username, email FROM users WHERE id = ? LIMIT 1")
+      .bind(userId)
+      .first<TelegramUserRow | null>();
+    return {
+      username: row?.username?.trim() || `#${userId}`,
+      email: row?.email?.trim() || "-",
+    };
+  }
+
+  private async sendTicketMessageToTelegramTopic(
+    config: TelegramTicketDispatchConfig,
+    ticketId: number,
+    ticketTitle: string,
+    text: string
+  ) {
+    const threadId = await this.getOrCreateTelegramTicketThread(config, ticketId, ticketTitle);
+    if (!threadId) {
+      return;
+    }
+    await this.callTelegramApi(
+      config,
+      "sendMessage",
+      {
+        chat_id: config.groupChatId,
+        message_thread_id: threadId,
+        text: this.limitText(text, 3800),
+        disable_web_page_preview: true,
+      }
+    );
+  }
+
+  private async forwardTicketCreatedToTelegram(
+    ticketId: number,
+    userId: number,
+    title: string,
+    content: string,
+    fallbackUsername?: string,
+    fallbackEmail?: string
+  ) {
+    const config = await this.loadTelegramTicketDispatchConfig();
+    if (!config) {
+      return;
+    }
+    const user = await this.resolveUserDisplay(userId, fallbackUsername, fallbackEmail);
+    const text = [
+      `📩 新工单 #${ticketId}`,
+      `用户：${user.username} (ID: ${userId})`,
+      `邮箱：${user.email}`,
+      `标题：${title}`,
+      "",
+      "内容：",
+      content,
+    ].join("\n");
+    await this.sendTicketMessageToTelegramTopic(config, ticketId, title, text);
+  }
+
+  private async forwardUserReplyToTelegram(
+    ticketId: number,
+    userId: number,
+    title: string,
+    content: string,
+    fallbackUsername?: string
+  ) {
+    const config = await this.loadTelegramTicketDispatchConfig();
+    if (!config) {
+      return;
+    }
+    const user = await this.resolveUserDisplay(userId, fallbackUsername, undefined);
+    const text = [
+      `💬 用户回复工单 #${ticketId}`,
+      `用户：${user.username} (ID: ${userId})`,
+      "",
+      content,
+    ].join("\n");
+    await this.sendTicketMessageToTelegramTopic(config, ticketId, title, text);
+  }
+
   async createTicket(request: Request) {
     try {
       const auth = await this.requireUser(request);
@@ -198,6 +471,20 @@ export class TicketAPI {
             created_at: fallbackNow,
             updated_at: fallbackNow,
           };
+
+      const createdTicketId = Number(responseTicket.id || result.meta.last_row_id || 0);
+      if (createdTicketId > 0) {
+        void this.forwardTicketCreatedToTelegram(
+          createdTicketId,
+          auth.user.id,
+          title,
+          content,
+          auth.user.username,
+          auth.user.email
+        ).catch((error) => {
+          console.warn("forwardTicketCreatedToTelegram error:", error);
+        });
+      }
 
       return successResponse(responseTicket, "工单创建成功");
     } catch (error: unknown) {
@@ -493,9 +780,9 @@ export class TicketAPI {
       }
 
       const ticket = await this.db.db
-        .prepare("SELECT id, user_id, status FROM tickets WHERE id = ?")
+        .prepare("SELECT id, user_id, status, title FROM tickets WHERE id = ?")
         .bind(ticketId)
-        .first<{ id: number; user_id: number; status: TicketStatus } | null>();
+        .first<{ id: number; user_id: number; status: TicketStatus; title?: string } | null>();
 
       if (!ticket || ticket.user_id !== auth.user.id) {
         return errorResponse("工单不存在或无权访问", 404);
@@ -538,6 +825,16 @@ export class TicketAPI {
         )
         .bind(ticketId)
         .run();
+
+      void this.forwardUserReplyToTelegram(
+        ticketId,
+        auth.user.id,
+        ticket.title || `工单 #${ticketId}`,
+        content,
+        auth.user.username
+      ).catch((error) => {
+        console.warn("forwardUserReplyToTelegram error:", error);
+      });
 
       const replies = await this.getReplies(ticketId);
       return successResponse({ replies, status: "open" as TicketStatus }, "回复已发送");
