@@ -2666,8 +2666,14 @@ async fn post_ticket(
         }),
     };
 
-    let _ =
-        forward_user_ticket_to_telegram_topic(&state, ticket_id, user_id, &title, &content).await;
+    if let Err(err) =
+        forward_user_ticket_to_telegram_topic(&state, ticket_id, user_id, &title, &content).await
+    {
+        eprintln!(
+            "[telegram-ticket] forward create ticket failed: ticket_id={}, error={}",
+            ticket_id, err
+        );
+    }
 
     success(ticket, "工单已提交").into_response()
 }
@@ -2790,14 +2796,20 @@ async fn post_ticket_reply(
         return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string(), None);
     }
 
-    let _ = forward_user_ticket_reply_to_telegram_topic(
+    if let Err(err) = forward_user_ticket_reply_to_telegram_topic(
         &state,
         ticket_id,
         user_id,
         &ticket_title,
         &content,
     )
-    .await;
+    .await
+    {
+        eprintln!(
+            "[telegram-ticket] forward user reply failed: ticket_id={}, error={}",
+            ticket_id, err
+        );
+    }
 
     let replies = match list_ticket_replies(&state, ticket_id).await {
         Ok(value) => value,
@@ -4338,8 +4350,20 @@ async fn call_telegram_method(
 
     let status = response.status();
     let body = response.json::<Value>().await.unwrap_or(Value::Null);
-    if !status.is_success() || body.get("ok").and_then(Value::as_bool).unwrap_or(true) == false {
-        return Ok(None);
+    let description = body
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !status.is_success() {
+        return Err(format!(
+            "Telegram {} HTTP {} {}",
+            method,
+            status.as_u16(),
+            description
+        ));
+    }
+    if body.get("ok").and_then(Value::as_bool).unwrap_or(true) == false {
+        return Err(format!("Telegram {} failed: {}", method, description));
     }
     Ok(body.get("result").cloned())
 }
@@ -4390,7 +4414,7 @@ async fn ensure_ticket_topic_thread(
         .and_then(Value::as_i64)
         .unwrap_or(0);
     if thread_id <= 0 {
-        return Ok(None);
+        return Err("Telegram createForumTopic 未返回有效的话题 ID".to_string());
     }
 
     sqlx::query(
@@ -4427,17 +4451,32 @@ async fn send_ticket_message_to_topic(
         _ => return Ok(()),
     };
 
-    let _ = call_telegram_method(
+    let message_text = truncate_ticket_text(text, TELEGRAM_TICKET_TEXT_MAX_LEN);
+    let markdown_result = call_telegram_method(
         config,
         "sendMessage",
         json!({
           "chat_id": config.group_chat_id,
           "message_thread_id": thread_id,
-          "text": truncate_ticket_text(text, TELEGRAM_TICKET_TEXT_MAX_LEN),
+          "text": message_text,
+          "parse_mode": "Markdown",
           "disable_web_page_preview": true
         }),
     )
-    .await?;
+    .await;
+    if markdown_result.is_err() {
+        let _ = call_telegram_method(
+            config,
+            "sendMessage",
+            json!({
+              "chat_id": config.group_chat_id,
+              "message_thread_id": thread_id,
+              "text": message_text,
+              "disable_web_page_preview": true
+            }),
+        )
+        .await?;
+    }
     Ok(())
 }
 

@@ -357,13 +357,28 @@ export class TicketAPI {
     if (!threadId) {
       return;
     }
+    const messageText = this.limitText(text, 3800);
+    const markdownResult = await this.callTelegramApi(
+      config,
+      "sendMessage",
+      {
+        chat_id: config.groupChatId,
+        message_thread_id: threadId,
+        text: messageText,
+        parse_mode: "Markdown",
+        disable_web_page_preview: true,
+      }
+    );
+    if (markdownResult) {
+      return;
+    }
     await this.callTelegramApi(
       config,
       "sendMessage",
       {
         chat_id: config.groupChatId,
         message_thread_id: threadId,
-        text: this.limitText(text, 3800),
+        text: messageText,
         disable_web_page_preview: true,
       }
     );
@@ -474,16 +489,18 @@ export class TicketAPI {
 
       const createdTicketId = Number(responseTicket.id || result.meta.last_row_id || 0);
       if (createdTicketId > 0) {
-        void this.forwardTicketCreatedToTelegram(
-          createdTicketId,
-          auth.user.id,
-          title,
-          content,
-          auth.user.username,
-          auth.user.email
-        ).catch((error) => {
+        try {
+          await this.forwardTicketCreatedToTelegram(
+            createdTicketId,
+            auth.user.id,
+            title,
+            content,
+            auth.user.username,
+            auth.user.email
+          );
+        } catch (error) {
           console.warn("forwardTicketCreatedToTelegram error:", error);
-        });
+        }
       }
 
       return successResponse(responseTicket, "工单创建成功");
@@ -826,15 +843,17 @@ export class TicketAPI {
         .bind(ticketId)
         .run();
 
-      void this.forwardUserReplyToTelegram(
-        ticketId,
-        auth.user.id,
-        ticket.title || `工单 #${ticketId}`,
-        content,
-        auth.user.username
-      ).catch((error) => {
+      try {
+        await this.forwardUserReplyToTelegram(
+          ticketId,
+          auth.user.id,
+          ticket.title || `工单 #${ticketId}`,
+          content,
+          auth.user.username
+        );
+      } catch (error) {
         console.warn("forwardUserReplyToTelegram error:", error);
-      });
+      }
 
       const replies = await this.getReplies(ticketId);
       return successResponse({ replies, status: "open" as TicketStatus }, "回复已发送");

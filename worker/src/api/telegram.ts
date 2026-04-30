@@ -17,6 +17,7 @@ type DbRow = Record<string, unknown>;
 
 type TelegramMessage = {
   text?: string;
+  entities?: TelegramMessageEntity[];
   message_id?: string | number | bigint;
   message_thread_id?: string | number | bigint;
   from?: {
@@ -26,6 +27,18 @@ type TelegramMessage = {
   chat?: {
     id?: string | number | bigint;
     type?: string;
+    is_forum?: boolean;
+  };
+};
+
+type TelegramMessageEntity = {
+  type?: string;
+  offset?: string | number | bigint;
+  length?: string | number | bigint;
+  url?: string;
+  language?: string;
+  user?: {
+    id?: string | number | bigint;
   };
 };
 
@@ -1274,6 +1287,7 @@ export class TelegramAPI {
   ) {
     const userId = this.normalizeChatId(message.from?.id);
     const chatType = ensureString(message.chat?.type, "").trim() || "unknown";
+    const isForum = message.chat?.is_forum === true;
     const threadId = this.normalizeThreadId(message.message_thread_id);
 
     const lines = [
@@ -1281,6 +1295,7 @@ export class TelegramAPI {
       `用户 ID：${userId || "-"}`,
       `聊天 ID：${chatId}`,
       `聊天类型：${chatType}`,
+      `论坛话题：${isForum ? "已开启" : "未开启/未知"}`,
     ];
     if (threadId > 0) {
       lines.push(`话题 ID：${threadId}`);
@@ -1293,6 +1308,7 @@ export class TelegramAPI {
       user_id: userId || null,
       chat_id: chatId,
       chat_type: chatType,
+      is_forum: isForum,
       message_thread_id: threadId > 0 ? threadId : null,
     });
   }
@@ -1579,6 +1595,107 @@ export class TelegramAPI {
     return 0;
   }
 
+  private normalizeEntityPos(raw: unknown): number {
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+      return Math.max(0, Math.trunc(raw));
+    }
+    if (typeof raw === "string") {
+      const parsed = Number.parseInt(raw.trim(), 10);
+      if (Number.isFinite(parsed)) {
+        return Math.max(0, parsed);
+      }
+    }
+    if (typeof raw === "bigint") {
+      if (raw <= 0n) return 0;
+      if (raw > BigInt(Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER;
+      return Number(raw);
+    }
+    return 0;
+  }
+
+  private entityMarkers(entity: TelegramMessageEntity): { start: string; end: string } | null {
+    const type = ensureString(entity.type, "").trim();
+    if (!type) return null;
+
+    if (type === "bold") return { start: "**", end: "**" };
+    if (type === "italic") return { start: "*", end: "*" };
+    if (type === "strikethrough") return { start: "~~", end: "~~" };
+    if (type === "spoiler") return { start: "||", end: "||" };
+    if (type === "code") return { start: "`", end: "`" };
+    if (type === "pre") {
+      const language = ensureString(entity.language, "").trim();
+      return {
+        start: language ? `\`\`\`${language}\n` : "```\n",
+        end: "\n```",
+      };
+    }
+    if (type === "text_link") {
+      const url = ensureString(entity.url, "").trim();
+      if (!url) return null;
+      return { start: "[", end: `](${url})` };
+    }
+    if (type === "text_mention") {
+      const userId = this.normalizeChatId(entity.user?.id);
+      if (!userId) return null;
+      return { start: "[", end: `](tg://user?id=${userId})` };
+    }
+    return null;
+  }
+
+  private telegramTextToMarkdown(textRaw: string, entitiesRaw: unknown): string {
+    const text = ensureString(textRaw, "");
+    const entities = Array.isArray(entitiesRaw)
+      ? (entitiesRaw as TelegramMessageEntity[])
+      : [];
+    if (!entities.length || !text) {
+      return text;
+    }
+
+    const starts = new Map<number, string[]>();
+    const ends = new Map<number, string[]>();
+    for (const entity of entities) {
+      const markers = this.entityMarkers(entity);
+      if (!markers) continue;
+
+      const startPos = Math.min(this.normalizeEntityPos(entity.offset), text.length);
+      const length = this.normalizeEntityPos(entity.length);
+      if (length <= 0) continue;
+      const endPos = Math.min(startPos + length, text.length);
+      if (endPos <= startPos) continue;
+
+      const startList = starts.get(startPos) ?? [];
+      startList.push(markers.start);
+      starts.set(startPos, startList);
+
+      const endList = ends.get(endPos) ?? [];
+      endList.push(markers.end);
+      ends.set(endPos, endList);
+    }
+
+    let out = "";
+    for (let i = 0; i <= text.length; i += 1) {
+      const endMarkers = ends.get(i);
+      if (endMarkers?.length) {
+        for (let j = endMarkers.length - 1; j >= 0; j -= 1) {
+          out += endMarkers[j];
+        }
+      }
+
+      const startMarkers = starts.get(i);
+      if (startMarkers?.length) {
+        for (const marker of startMarkers) {
+          out += marker;
+        }
+      }
+
+      if (i < text.length) {
+        out += text[i];
+      }
+    }
+
+    return out;
+  }
+
   private async loadTicketGroupChatId(): Promise<string> {
     const value = (
       await this.configManager.getSystemConfig("telegram_ticket_group_id", "")
@@ -1608,7 +1725,10 @@ export class TelegramAPI {
       return successResponse({ ok: true, skipped: "ticket_topic_sender_is_bot" });
     }
 
-    const replyText = ensureString(message.text, "").trim();
+    const replyText = this.telegramTextToMarkdown(
+      ensureString(message.text, ""),
+      message.entities
+    ).trim();
     if (!replyText) {
       return successResponse({ ok: true, skipped: "ticket_topic_empty_text" });
     }
@@ -1714,7 +1834,9 @@ export class TelegramAPI {
             replyText,
           ]
             .filter(Boolean)
-            .join("\n")
+            .join("\n"),
+          undefined,
+          "Markdown"
         );
       }
     }
@@ -2053,7 +2175,8 @@ export class TelegramAPI {
     botConfig: TelegramBotConfig,
     chatId: string,
     text: string,
-    replyMarkup?: Record<string, unknown>
+    replyMarkup?: Record<string, unknown>,
+    parseMode?: "Markdown" | "MarkdownV2" | "HTML"
   ) {
     if (!botConfig.token) {
       return;
@@ -2061,24 +2184,63 @@ export class TelegramAPI {
 
     try {
       const endpoint = `${botConfig.apiBase.replace(/\/+$/, "")}/bot${botConfig.token}/sendMessage`;
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json; charset=utf-8",
-          "User-Agent": "Soga-Panel/1.0",
-        },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text,
-          disable_web_page_preview: true,
-          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        }),
-      });
-      if (!response.ok) {
+      const basePayload: Record<string, unknown> = {
+        chat_id: chatId,
+        text,
+        disable_web_page_preview: true,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      };
+
+      const send = async (payload: Record<string, unknown>) => {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "Soga-Panel/1.0",
+          },
+          body: JSON.stringify(payload),
+        });
+        const body = (await response.json().catch(() => ({}))) as {
+          ok?: boolean;
+          description?: string;
+        };
+        return { response, body };
+      };
+
+      if (parseMode) {
+        const first = await send({ ...basePayload, parse_mode: parseMode });
+        if (first.response.ok && first.body?.ok !== false) {
+          return;
+        }
+
+        const shouldFallback =
+          ensureString(first.body?.description, "").toLowerCase().includes("can't parse entities");
+        if (!shouldFallback) {
+          console.error(
+            "Telegram webhook reply failed:",
+            first.response.status,
+            ensureString(first.body?.description, "")
+          );
+          return;
+        }
+
+        const fallback = await send(basePayload);
+        if (!fallback.response.ok || fallback.body?.ok === false) {
+          console.error(
+            "Telegram webhook fallback reply failed:",
+            fallback.response.status,
+            ensureString(fallback.body?.description, "")
+          );
+        }
+        return;
+      }
+
+      const response = await send(basePayload);
+      if (!response.response.ok || response.body?.ok === false) {
         console.error(
           "Telegram webhook reply failed:",
-          response.status,
-          await response.text().catch(() => "")
+          response.response.status,
+          ensureString(response.body?.description, "")
         );
       }
     } catch (error) {

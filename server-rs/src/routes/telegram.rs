@@ -8,7 +8,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use urlencoding::encode;
 
 use super::auth::list_system_configs;
@@ -1154,6 +1154,11 @@ async fn handle_id_command(
         .and_then(|chat| chat.get("type"))
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    let is_forum = message
+        .get("chat")
+        .and_then(|chat| chat.get("is_forum"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let thread_id = value_to_thread_id(message.get("message_thread_id"));
 
     let mut lines = vec![
@@ -1168,6 +1173,14 @@ async fn handle_id_command(
         ),
         format!("聊天 ID：{}", chat_id),
         format!("聊天类型：{}", chat_type),
+        format!(
+            "论坛话题：{}",
+            if is_forum {
+                "已开启"
+            } else {
+                "未开启/未知"
+            }
+        ),
     ];
     if thread_id > 0 {
         lines.push(format!("话题 ID：{}", thread_id));
@@ -1180,6 +1193,7 @@ async fn handle_id_command(
       "user_id": if user_id.trim().is_empty() { Value::Null } else { json!(user_id.trim()) },
       "chat_id": chat_id,
       "chat_type": chat_type,
+      "is_forum": is_forum,
       "message_thread_id": if thread_id > 0 { json!(thread_id) } else { Value::Null }
     }))
 }
@@ -2532,6 +2546,156 @@ fn truncate_ticket_text(text: &str, max_len: usize) -> String {
     out
 }
 
+fn value_to_nonnegative_usize(value: Option<&Value>) -> usize {
+    if let Some(v) = value {
+        if let Some(num) = v.as_u64() {
+            return num.min(usize::MAX as u64) as usize;
+        }
+        if let Some(num) = v.as_i64() {
+            return num.max(0) as usize;
+        }
+        if let Some(text) = v.as_str() {
+            return text.trim().parse::<usize>().unwrap_or(0);
+        }
+    }
+    0
+}
+
+fn utf16_to_byte_index(text: &str, target_utf16: usize) -> usize {
+    if target_utf16 == 0 {
+        return 0;
+    }
+    let mut utf16_count = 0usize;
+    for (byte_idx, ch) in text.char_indices() {
+        if utf16_count >= target_utf16 {
+            return byte_idx;
+        }
+        utf16_count += ch.len_utf16();
+        if utf16_count > target_utf16 {
+            return byte_idx + ch.len_utf8();
+        }
+    }
+    text.len()
+}
+
+fn telegram_entity_markers(entity: &Value) -> Option<(String, String)> {
+    let entity_type = entity
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    match entity_type {
+        "bold" => Some(("**".to_string(), "**".to_string())),
+        "italic" => Some(("*".to_string(), "*".to_string())),
+        "strikethrough" => Some(("~~".to_string(), "~~".to_string())),
+        "spoiler" => Some(("||".to_string(), "||".to_string())),
+        "code" => Some(("`".to_string(), "`".to_string())),
+        "pre" => {
+            let language = entity
+                .get("language")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if language.is_empty() {
+                Some(("```\n".to_string(), "\n```".to_string()))
+            } else {
+                Some((format!("```{}\n", language), "\n```".to_string()))
+            }
+        }
+        "text_link" => {
+            let url = entity
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if url.is_empty() {
+                None
+            } else {
+                Some(("[".to_string(), format!("]({})", url)))
+            }
+        }
+        "text_mention" => {
+            let user_id = entity
+                .get("user")
+                .and_then(|user| user.get("id"))
+                .and_then(value_to_chat_id)
+                .unwrap_or_default();
+            if user_id.is_empty() {
+                None
+            } else {
+                Some(("[".to_string(), format!("](tg://user?id={})", user_id)))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn telegram_message_text_to_markdown(message: &Value) -> String {
+    let text = message
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let entities = message
+        .get("entities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if entities.is_empty() || text.is_empty() {
+        return text;
+    }
+
+    let mut starts: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut ends: HashMap<usize, Vec<String>> = HashMap::new();
+    for entity in entities {
+        let markers = match telegram_entity_markers(&entity) {
+            Some(value) => value,
+            None => continue,
+        };
+        let offset_utf16 = value_to_nonnegative_usize(entity.get("offset"));
+        let length_utf16 = value_to_nonnegative_usize(entity.get("length"));
+        if length_utf16 == 0 {
+            continue;
+        }
+
+        let start_byte = utf16_to_byte_index(&text, offset_utf16);
+        let end_byte = utf16_to_byte_index(&text, offset_utf16 + length_utf16);
+        if end_byte <= start_byte || end_byte > text.len() {
+            continue;
+        }
+
+        starts.entry(start_byte).or_default().push(markers.0);
+        ends.entry(end_byte).or_default().push(markers.1);
+    }
+
+    let mut out = String::new();
+    for (idx, ch) in text.char_indices() {
+        if let Some(end_list) = ends.get(&idx) {
+            for marker in end_list.iter().rev() {
+                out.push_str(marker);
+            }
+        }
+        if let Some(start_list) = starts.get(&idx) {
+            for marker in start_list {
+                out.push_str(marker);
+            }
+        }
+        out.push(ch);
+    }
+    let end_idx = text.len();
+    if let Some(end_list) = ends.get(&end_idx) {
+        for marker in end_list.iter().rev() {
+            out.push_str(marker);
+        }
+    }
+    if let Some(start_list) = starts.get(&end_idx) {
+        for marker in start_list {
+            out.push_str(marker);
+        }
+    }
+    out
+}
+
 async fn handle_ticket_topic_reply_message(
     state: &AppState,
     config: &TelegramBotConfig,
@@ -2561,11 +2725,8 @@ async fn handle_ticket_topic_reply_message(
         ));
     }
 
-    let reply_text = message
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
+    let reply_text = telegram_message_text_to_markdown(message);
+    let reply_text = reply_text.trim();
     if reply_text.is_empty() {
         return Ok(Some(
             json!({ "ok": true, "skipped": "ticket_topic_empty_text" }),
@@ -2706,7 +2867,7 @@ async fn handle_ticket_topic_reply_message(
             })
             .unwrap_or_default();
         if !owner_chat_id.trim().is_empty() {
-            let _ = send_telegram_message(
+            let _ = send_telegram_markdown_message(
                 config,
                 owner_chat_id.trim(),
                 &[
@@ -3217,6 +3378,64 @@ async fn send_telegram_message(
     }
 
     Ok(())
+}
+
+async fn send_telegram_markdown_message(
+    config: &TelegramBotConfig,
+    chat_id: &str,
+    text: &str,
+    reply_markup: Option<Value>,
+) -> Result<(), String> {
+    if config.token.trim().is_empty() || chat_id.trim().is_empty() {
+        return Ok(());
+    }
+
+    let endpoint = format!(
+        "{}/bot{}/sendMessage",
+        config.api_base.trim_end_matches('/'),
+        config.token
+    );
+
+    let mut payload = json!({
+      "chat_id": chat_id,
+      "text": text,
+      "parse_mode": "Markdown",
+      "disable_web_page_preview": true
+    });
+    if let Some(value) = reply_markup.clone() {
+        payload["reply_markup"] = value;
+    }
+
+    let response = reqwest::Client::new()
+        .post(endpoint.clone())
+        .header("User-Agent", "Soga-Panel-Server/1.0")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let status = response.status();
+    let body = response.json::<Value>().await.unwrap_or(Value::Null);
+    if status.is_success() && body.get("ok").and_then(Value::as_bool).unwrap_or(true) {
+        return Ok(());
+    }
+
+    let description = body
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_lowercase();
+    if description.contains("can't parse entities") {
+        return send_telegram_message(config, chat_id, text, reply_markup).await;
+    }
+
+    Err(format!(
+        "Telegram Markdown 发送失败: status={}, description={}",
+        status.as_u16(),
+        body.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    ))
 }
 
 async fn answer_callback_query(
